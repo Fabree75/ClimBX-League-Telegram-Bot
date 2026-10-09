@@ -2,3 +2,16 @@
 *.sqlite3
 __pycache__/
 .venv/
+
+# Testing
+test_*.py
+*_test.py
+tests/
+test/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
