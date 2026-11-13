@@ -1726,14 +1726,35 @@ def build_application(
     return application
 
 
+def _load_env_file(path: str = ".env") -> None:
+    """Loads key-value pairs from .env if present and not already set in os.environ."""
+    env_path = Path(path)
+    if not env_path.is_file():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    _load_env_file()
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN must be set")
     if not _admin_ids():
         LOGGER.warning("ADMIN_IDS is empty or invalid; no admin commands will be authorized.")
     application = build_application(token, os.getenv("DATABASE_PATH", "climbx_league.sqlite3"))
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
     application.run_polling()
 
 
