@@ -6,21 +6,25 @@ Telegram bot for the climbing league at École Polytechnique. Students can regis
 
 - **Student Flow**:
   - `/register`: Register or update full name and Polytechnique / IP Paris email address (in private chat).
-  - `/routes`: View currently active routes, points, and your personal status (`✅ Completed`, `⏳ Pending review`) plus overall progress.
+  - `/routes [category]`: View currently active routes grouped by location category (`Arkose`, `ENSTA gym`, `Pan`, `Outdoors`), points, picture count, and your personal status (`✅ Completed`, `⏳ Pending review`) plus overall progress.
+  - `/route [route_id]`: View full info and pictures for a specific route (or pick from an interactive list).
   - `/submit [route_id]`: Submit a video proof for a route (either directly with `/submit <id>` or interactively via `/submit`). Supports regular videos, video notes, video documents, and muted videos (`animation`); rejects photo uploads with clear guidance on video proof rules. Prevents duplicate submissions if already approved or pending review, and allows re-submission if previously rejected.
   - `/withdraw <route_id>`: Withdraw a pending submission before it is reviewed.
-  - `/profile` (or `/me`): View personal rank, total points, completed tops, and pending submissions.
+  - `/profile` (or `/me`): View personal rank, total points, completed tops, pending submissions, and admin role badge if applicable.
   - `/leaderboard`: View real-time rankings with podium medals (`🥇, 🥈, 🥉`), tops count tie-breaking, shared tie ranks, and personal rank summary.
   - `/help`: View competition video rules and available commands.
-  - `/cancel`: Cancel active registration or submission flow.
+  - `/cancel`: Cancel active registration, submission, or route creation flow.
 
 - **Admin Moderation & Lifecycle**:
+  - **Admin Visibility**: `/admin` confirms admin status and lists all admin rights & commands; `/start`, `/help`, and `/profile` also indicate admin rights when enabled.
   - **Inline Video Review Cards**: Admins receive instant video previews with `[Approve ✅]` and `[Reject ❌]` inline buttons whenever a student submits proof; reviewing on one admin's card automatically syncs and clears buttons across all other admins' cards.
   - **Student Feedback**: Students automatically receive Telegram notifications when their climb is approved (with points awarded) or rejected (including optional admin feedback).
-  - `/addroute <name> <points>`: Publish a new climbing route.
+  - `/addroute`: Guided interactive flow to publish a route with location category (`Arkose`, `ENSTA gym`, `Pan`, `Outdoors`), name, points, and one or more pictures. Also supports quick publish (`/addroute <name> <points> [category]`, `/addroute <category> | <name> | <points>`, or attaching a photo with the command as caption).
+  - `/addroutephoto <route_id>`: Add picture(s) to an existing route (interactively or via photo caption).
+  - `/setroutecategory <route_id> <category>`: Set or update a route's location category.
   - `/deactivateroute <route_id>`: Deactivate an expired or retired route (prevents new submissions).
   - `/activateroute <route_id>`: Reactivate a route.
-  - `/routes all`: View all routes including inactive ones.
+  - `/routes all [category]`: View all routes including inactive ones.
   - `/pending`: List pending video submissions.
   - `/submission <submission_id>` (or `/view <submission_id>`): Re-send the video preview and inline review card for any submission on demand.
   - `/approve <submission_id>` / `/reject <submission_id> [reason]`: Text commands to review submissions (with optional rejection reason sent to the student).

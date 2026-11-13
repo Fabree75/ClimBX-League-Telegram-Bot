@@ -17,11 +17,20 @@ import logging
 import os
 import re
 import sqlite3
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    Bot,
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaDocument,
+    InputMediaPhoto,
+    Update,
+)
 from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
@@ -33,9 +42,34 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.warnings import PTBUserWarning
 
 LOGGER = logging.getLogger(__name__)
-REGISTER_NAME, REGISTER_EMAIL, SUBMIT_ROUTE, SUBMIT_PROOF = range(4)
+(
+    REGISTER_NAME,
+    REGISTER_EMAIL,
+    SUBMIT_ROUTE,
+    SUBMIT_PROOF,
+    ADDROUTE_CATEGORY,
+    ADDROUTE_NAME,
+    ADDROUTE_POINTS,
+    ADDROUTE_PHOTOS,
+    ADDROUTEPHOTO_WAIT,
+) = range(9)
+
+ROUTE_CATEGORIES: tuple[str, ...] = ("Arkose", "ENSTA gym", "Pan", "Outdoors")
+_CATEGORY_ALIASES: dict[str, str] = {
+    "arkose": "Arkose",
+    "ensta gym": "ENSTA gym",
+    "ensta": "ENSTA gym",
+    "ensta_gym": "ENSTA gym",
+    "enstagym": "ENSTA gym",
+    "pan": "Pan",
+    "outdoors": "Outdoors",
+    "outdoor": "Outdoors",
+}
+MAX_TELEGRAM_CAPTION_LENGTH = 1024
+MAX_MEDIA_GROUP_SIZE = 10
 
 MAX_TELEGRAM_MESSAGE_LENGTH = 4096
 SAFE_MESSAGE_CHUNK_LENGTH = 4000
@@ -115,12 +149,20 @@ async def _reply_chunked(message: Any, text: str, **kwargs: Any) -> None:
         await message.reply_text(chunk, **kwargs)
 
 
+def normalize_route_category(raw: str) -> Optional[str]:
+    """Normalizes a route category string to one of ROUTE_CATEGORIES, or None."""
+    cleaned = _sanitize_single_line(raw).lower()
+    return _CATEGORY_ALIASES.get(cleaned)
+
+
 @dataclass(frozen=True)
 class Route:
     id: int
     name: str
     points: int
     active: bool
+    category: Optional[str] = None
+    photo_count: int = 0
 
 
 class LeagueStore:
@@ -150,8 +192,20 @@ class LeagueStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 points INTEGER NOT NULL CHECK(points > 0),
-                active INTEGER NOT NULL DEFAULT 1
+                active INTEGER NOT NULL DEFAULT 1,
+                category TEXT
+                    CHECK(category IS NULL OR category IN ('Arkose', 'ENSTA gym', 'Pan', 'Outdoors'))
             );
+            CREATE TABLE IF NOT EXISTS route_photos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                route_id INTEGER NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
+                file_id TEXT NOT NULL,
+                media_type TEXT NOT NULL DEFAULT 'photo'
+                    CHECK(media_type IN ('photo', 'document')),
+                added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_route_photos_route_id
+                ON route_photos(route_id, id);
             CREATE TABLE IF NOT EXISTS submissions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id INTEGER NOT NULL REFERENCES students(telegram_id),
@@ -187,6 +241,12 @@ class LeagueStore:
             )
         except sqlite3.IntegrityError:
             LOGGER.warning("Existing duplicate active submissions prevented unique index creation")
+        route_columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(routes)").fetchall()
+        }
+        if "category" not in route_columns:
+            self._connection.execute("ALTER TABLE routes ADD COLUMN category TEXT")
         columns = {
             row["name"]
             for row in self._connection.execute("PRAGMA table_info(submissions)").fetchall()
@@ -241,15 +301,87 @@ class LeagueStore:
             )
         )
 
-    def add_route(self, name: str, points: int) -> int:
+    def add_route(
+        self,
+        name: str,
+        points: int,
+        category: Optional[str] = None,
+        photos: Optional[Sequence[tuple[str, str] | str]] = None,
+    ) -> int:
         cleaned_name = _sanitize_single_line(name)
         if not cleaned_name:
             raise ValueError("route name cannot be empty")
+        normalized_category: Optional[str] = None
+        if category is not None:
+            normalized_category = normalize_route_category(category)
+            if normalized_category is None:
+                raise ValueError("invalid route category")
+
+        validated_photos: list[tuple[str, str]] = []
+        if photos:
+            for item in photos:
+                if isinstance(item, str):
+                    media_type, file_id = "photo", item
+                else:
+                    media_type, file_id = item
+                if media_type not in {"photo", "document"}:
+                    raise ValueError("invalid photo media_type")
+                if not file_id or not file_id.strip():
+                    raise ValueError("photo file_id cannot be empty")
+                validated_photos.append((media_type, file_id.strip()))
+
         cursor = self._connection.execute(
-            "INSERT INTO routes (name, points) VALUES (?, ?)", (cleaned_name, points)
+            "INSERT INTO routes (name, points, category) VALUES (?, ?, ?)",
+            (cleaned_name, points, normalized_category),
+        )
+        route_id = int(cursor.lastrowid)
+        if validated_photos:
+            self._connection.executemany(
+                "INSERT INTO route_photos (route_id, file_id, media_type) VALUES (?, ?, ?)",
+                [(route_id, fid, mtype) for mtype, fid in validated_photos],
+            )
+        self._connection.commit()
+        return route_id
+
+    def add_route_photo(
+        self, route_id: int, file_id: str, media_type: str = "photo"
+    ) -> int:
+        if self.get_route(route_id) is None:
+            raise ValueError("route not found")
+        if media_type not in {"photo", "document"}:
+            raise ValueError("invalid photo media_type")
+        if not file_id or not file_id.strip():
+            raise ValueError("photo file_id cannot be empty")
+        cursor = self._connection.execute(
+            "INSERT INTO route_photos (route_id, file_id, media_type) VALUES (?, ?, ?)",
+            (route_id, file_id.strip(), media_type),
         )
         self._connection.commit()
         return int(cursor.lastrowid)
+
+    def get_route_photos(self, route_id: int) -> list[sqlite3.Row]:
+        return list(
+            self._connection.execute(
+                """
+                SELECT id, route_id, file_id, media_type, added_at
+                FROM route_photos
+                WHERE route_id = ?
+                ORDER BY id
+                """,
+                (route_id,),
+            )
+        )
+
+    def set_route_category(self, route_id: int, category: str) -> bool:
+        normalized = normalize_route_category(category)
+        if normalized is None:
+            raise ValueError("invalid route category")
+        cursor = self._connection.execute(
+            "UPDATE routes SET category = ? WHERE id = ?",
+            (normalized, route_id),
+        )
+        self._connection.commit()
+        return cursor.rowcount > 0
 
     def set_route_active(self, route_id: int, active: bool) -> bool:
         cursor = self._connection.execute(
@@ -258,28 +390,95 @@ class LeagueStore:
         self._connection.commit()
         return cursor.rowcount > 0
 
-    def list_routes(self, active_only: bool = True) -> list[Route]:
-        query = "SELECT id, name, points, active FROM routes"
+    def list_routes(
+        self, active_only: bool = True, category: Optional[str] = None
+    ) -> list[Route]:
+        conditions: list[str] = []
+        params: list[Any] = []
         if active_only:
-            query += " WHERE active = 1"
-        query += " ORDER BY id"
+            conditions.append("r.active = 1")
+        if category is not None:
+            normalized = normalize_route_category(category)
+            if normalized is None:
+                raise ValueError("invalid route category")
+            conditions.append("r.category = ?")
+            params.append(normalized)
+        where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"""
+            SELECT r.id, r.name, r.points, r.active, r.category,
+                   COUNT(rp.id) AS photo_count
+            FROM routes r
+            LEFT JOIN route_photos rp ON rp.route_id = r.id
+            {where_clause}
+            GROUP BY r.id
+            ORDER BY r.id
+        """
         return [
             Route(
                 id=int(row["id"]),
                 name=str(row["name"]),
                 points=int(row["points"]),
                 active=bool(row["active"]),
+                category=str(row["category"]) if row["category"] is not None else None,
+                photo_count=int(row["photo_count"]),
             )
-            for row in self._connection.execute(query)
+            for row in self._connection.execute(query, params)
         ]
 
     def get_route(self, route_id: int) -> Optional[Route]:
         row = self._connection.execute(
-            "SELECT id, name, points, active FROM routes WHERE id = ?", (route_id,)
+            """
+            SELECT r.id, r.name, r.points, r.active, r.category,
+                   COUNT(rp.id) AS photo_count
+            FROM routes r
+            LEFT JOIN route_photos rp ON rp.route_id = r.id
+            WHERE r.id = ?
+            GROUP BY r.id
+            """,
+            (route_id,),
         ).fetchone()
         if row is None:
             return None
-        return Route(int(row["id"]), str(row["name"]), int(row["points"]), bool(row["active"]))
+        return Route(
+            id=int(row["id"]),
+            name=str(row["name"]),
+            points=int(row["points"]),
+            active=bool(row["active"]),
+            category=str(row["category"]) if row["category"] is not None else None,
+            photo_count=int(row["photo_count"]),
+        )
+
+    def get_route_details(
+        self, route_id: int, telegram_id: Optional[int] = None
+    ) -> Optional[dict[str, Any]]:
+        route = self.get_route(route_id)
+        if route is None:
+            return None
+        photos = self.get_route_photos(route_id)
+        counts_row = self._connection.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS completions_count,
+                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_count
+            FROM submissions
+            WHERE route_id = ?
+            """,
+            (route_id,),
+        ).fetchone()
+        completions_count = int(counts_row["completions_count"] or 0) if counts_row else 0
+        pending_count = int(counts_row["pending_count"] or 0) if counts_row else 0
+        user_status = (
+            self.get_student_route_status(telegram_id, route_id)
+            if telegram_id is not None
+            else None
+        )
+        return {
+            "route": route,
+            "photos": [dict(p) for p in photos],
+            "completions_count": completions_count,
+            "pending_count": pending_count,
+            "user_status": user_status,
+        }
 
     def get_student_route_status(self, telegram_id: int, route_id: int) -> Optional[str]:
         """Returns 'approved' or 'pending' if the student has an active/completed submission, or None."""
@@ -604,19 +803,48 @@ def _is_admin(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id in _admin_ids())
 
 
+def _clear_conversation_data(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for key in (
+        "route_id",
+        "full_name",
+        "addroute_category",
+        "addroute_name",
+        "addroute_points",
+        "addroute_photos",
+        "addroutephoto_id",
+        "addroutephoto_count",
+    ):
+        context.user_data.pop(key, None)
+
+
+def _extract_photo_info(message: Any) -> Optional[tuple[str, str]]:
+    """Extracts (file_id, media_type) if message contains a photo/image, else None."""
+    photos = getattr(message, "photo", None)
+    if photos:
+        return photos[-1].file_id, "photo"
+    doc = getattr(message, "document", None)
+    if doc and getattr(doc, "mime_type", None) and str(doc.mime_type).startswith("image/"):
+        return doc.file_id, "document"
+    return None
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message:
         return
-    await update.effective_message.reply_text(
+    text = (
         "🧗 Welcome to the ClimbX League at École Polytechnique!\n\n"
         "• /register - Join the league or update your info\n"
-        "• /routes - View climbing routes & your progress\n"
+        "• /routes - View climbing routes & categories\n"
+        "• /route <route_id> - View full details & pictures of a route\n"
         "• /submit <route_id> - Send a video proof of your ascent\n"
         "• /withdraw <route_id> - Withdraw a pending submission\n"
         "• /profile - Check your rank, score, and completed tops\n"
         "• /leaderboard - View the live standings\n"
         "• /help - Rules & full command guide"
     )
+    if _is_admin(update):
+        text += "\n\n🛡️ You have admin rights! Use /admin or /help to see admin commands."
+    await update.effective_message.reply_text(text)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -626,9 +854,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "🧗 <b>ClimbX League Guide &amp; Rules</b>\n\n"
         "<b>How to Participate:</b>\n"
         "1. Register once with /register.\n"
-        "2. Check active routes with /routes.\n"
-        "3. Record a video of your climb and submit it with <code>/submit &lt;route_id&gt;</code>.\n"
-        "4. Once an admin approves your video, points are added to /leaderboard!\n\n"
+        "2. Check active routes with /routes (or filter by location: Arkose, ENSTA gym, Pan, Outdoors).\n"
+        "3. Inspect full route details &amp; pictures with <code>/route &lt;route_id&gt;</code>.\n"
+        "4. Record a video of your climb and submit it with <code>/submit &lt;route_id&gt;</code>.\n"
+        "5. Once an admin approves your video, points are added to /leaderboard!\n\n"
         "<b>Video Proof Requirements:</b>\n"
         "• <b>Start</b>: Establish a controlled start with both hands on the starting holds.\n"
         "• <b>Ascent</b>: Complete the route using only allowed holds (no off-route dabs).\n"
@@ -636,20 +865,26 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• <b>Format</b>: Must be a video (photos are not accepted).\n\n"
         "<b>Student Commands:</b>\n"
         "• /register - Register or update your name &amp; email\n"
-        "• /routes - List active routes and your status (✅/⏳)\n"
+        "• <code>/routes [category]</code> - List active routes and your status (✅/⏳)\n"
+        "• <code>/route [route_id]</code> - View full route info &amp; pictures\n"
         "• <code>/submit [route_id]</code> - Submit video proof for a route\n"
         "• <code>/withdraw &lt;route_id&gt;</code> - Cancel a pending submission\n"
         "• /profile - View your personal stats and completed routes\n"
         "• /leaderboard - View competition rankings\n"
-        "• /cancel - Cancel an ongoing registration or submission"
+        "• /cancel - Cancel an ongoing action"
     )
     if _is_admin(update):
         text += (
-            "\n\n<b>Admin Commands:</b>\n"
-            "• <code>/addroute &lt;name&gt; &lt;points&gt;</code> - Publish a new route\n"
+            "\n\n🛡️ <b>Admin Status:</b> You are an admin and have admin rights.\n"
+            "<b>Admin Commands:</b>\n"
+            "• /admin - View your admin status &amp; rights\n"
+            "• <code>/addroute</code> - Guided route creation (category, name, points, pictures)\n"
+            "• <code>/addroute &lt;name&gt; &lt;points&gt; [category]</code> - Quick publish (attach photo optionally)\n"
+            "• <code>/addroutephoto &lt;route_id&gt;</code> - Add picture(s) to an existing route\n"
+            "• <code>/setroutecategory &lt;route_id&gt; &lt;category&gt;</code> - Set route location category\n"
             "• <code>/deactivateroute &lt;id&gt;</code> - Retire/deactivate a route\n"
             "• <code>/activateroute &lt;id&gt;</code> - Reactivate a route\n"
-            "• <code>/routes all</code> - View all routes (including inactive)\n"
+            "• <code>/routes all [category]</code> - View all routes (including inactive)\n"
             "• /pending - List submissions awaiting review\n"
             "• <code>/submission &lt;id&gt;</code> - View video &amp; inline review buttons\n"
             "• <code>/approve &lt;id&gt;</code> - Approve a submission\n"
@@ -661,10 +896,36 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.effective_message.reply_text(text, parse_mode="HTML")
 
 
+async def admin_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_message:
+        return
+    user_id = update.effective_user.id if update.effective_user else None
+    if not _is_admin(update):
+        id_line = f" (Telegram ID: {user_id})" if user_id is not None else ""
+        await update.effective_message.reply_text(
+            f"Admin Status: Not an admin{id_line}.\n"
+            "You have standard climber access. Ask a league organizer if you need admin rights."
+        )
+        return
+
+    categories_str = ", ".join(ROUTE_CATEGORIES)
+    await update.effective_message.reply_text(
+        f"🛡️ Admin Status: Active (Telegram ID: {user_id})\n"
+        "You are an admin and have full admin rights in ClimbX League.\n\n"
+        "Your admin rights include:\n"
+        "• Route management: /addroute (with category & pictures), /addroutephoto, "
+        "/setroutecategory, /activateroute, /deactivateroute, /routes all\n"
+        "• Submission moderation: /pending, /submission <id>, /approve <id>, "
+        "/reject <id> [reason], /reopen <id>, and inline Approve/Reject buttons\n"
+        "• League operations: /export (CSV standings) and /broadcast <message>\n\n"
+        f"Route categories: {categories_str}"
+    )
+
+
 async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.effective_user or not update.effective_message:
         return ConversationHandler.END
-    context.user_data.pop("route_id", None)
+    _clear_conversation_data(context)
     if getattr(update.effective_chat, "type", None) in {"group", "supergroup"}:
         await update.effective_message.reply_text(
             "Please send /register in a private chat with me so your email stays private."
@@ -728,49 +989,95 @@ async def register_email_non_text(update: Update, context: ContextTypes.DEFAULT_
 async def routes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message:
         return
+    args = list(context.args or [])
     show_all = False
-    if context.args and context.args[0].lower() == "all" and _is_admin(update):
-        show_all = True
+    if args and args[0].lower() == "all":
+        if _is_admin(update):
+            show_all = True
+        args = args[1:]
+    elif args and len(args) > 1 and args[-1].lower() == "all":
+        if _is_admin(update):
+            show_all = True
+        args = args[:-1]
+
+    category_filter: Optional[str] = None
+    if args:
+        raw_cat = " ".join(args)
+        category_filter = normalize_route_category(raw_cat)
+        if category_filter is None:
+            await update.effective_message.reply_text(
+                f"Unknown category '{raw_cat}'. Available categories: {', '.join(ROUTE_CATEGORIES)}."
+            )
+            return
+
     store = _store(context)
-    available = store.list_routes(active_only=not show_all)
+    available = store.list_routes(active_only=not show_all, category=category_filter)
     if not available:
-        await update.effective_message.reply_text("No routes have been published yet.")
+        if category_filter:
+            await update.effective_message.reply_text(
+                f"No routes found in category '{category_filter}'."
+            )
+        else:
+            await update.effective_message.reply_text("No routes have been published yet.")
         return
 
     user_id = update.effective_user.id if update.effective_user else None
     statuses = store.get_student_route_statuses(user_id) if user_id else {}
 
-    lines = []
+    grouped: dict[Optional[str], list[Route]] = {}
+    for route in available:
+        grouped.setdefault(route.category, []).append(route)
+
+    ordered_keys: list[Optional[str]] = [cat for cat in ROUTE_CATEGORIES if cat in grouped]
+    if None in grouped:
+        ordered_keys.append(None)
+
+    lines: list[str] = []
     completed_count = 0
     active_count = 0
     earned_active_points = 0
+    show_headers = category_filter is not None or any(r.category is not None for r in available)
 
-    for route in available:
-        if route.active:
-            active_count += 1
-        status = statuses.get(route.id)
-        if status == "approved":
-            badge = "✅ "
-            status_suffix = " (Completed)"
+    for key in ordered_keys:
+        if show_headers:
+            header = f"📍 {key}" if key is not None else "📍 Other"
+            if lines:
+                lines.append("")
+            lines.append(header)
+
+        for route in grouped[key]:
             if route.active:
-                completed_count += 1
-                earned_active_points += route.points
-        elif status == "pending":
-            badge = "⏳ "
-            status_suffix = " (Pending review)"
-        else:
-            badge = ""
-            status_suffix = ""
+                active_count += 1
+            status = statuses.get(route.id)
+            if status == "approved":
+                badge = "✅ "
+                status_suffix = " (Completed)"
+                if route.active:
+                    completed_count += 1
+                    earned_active_points += route.points
+            elif status == "pending":
+                badge = "⏳ "
+                status_suffix = " (Pending review)"
+            else:
+                badge = ""
+                status_suffix = ""
 
-        inactive_suffix = "" if route.active else " [Inactive]"
-        lines.append(
-            f"{badge}#{route.id}: {route.name} - {route.points} points{status_suffix}{inactive_suffix}"
-        )
+            pic_suffix = f" [📸 {route.photo_count}]" if route.photo_count > 0 else ""
+            inactive_suffix = "" if route.active else " [Inactive]"
+            lines.append(
+                f"{badge}#{route.id}: {route.name} - {route.points} points"
+                f"{pic_suffix}{status_suffix}{inactive_suffix}"
+            )
 
     if user_id and store.is_registered(user_id):
         profile_info = store.get_student_profile(user_id)
         total_points = int(profile_info["points"]) if profile_info else earned_active_points
-        if total_points != earned_active_points:
+        if category_filter is not None:
+            lines.append(
+                f"\n{category_filter} progress: {completed_count}/{active_count} "
+                f"active routes completed ({earned_active_points} pts)"
+            )
+        elif total_points != earned_active_points:
             lines.append(
                 f"\nProgress: {completed_count}/{active_count} active routes completed "
                 f"({earned_active_points} pts active, {total_points} pts total)"
@@ -780,12 +1087,153 @@ async def routes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"\nProgress: {completed_count}/{active_count} active routes completed ({total_points} pts)"
             )
 
+    lines.append("Tip: Use /route <id> for full details & pictures, or /routes <category> to filter.")
     await _reply_chunked(update.effective_message, "\n".join(lines))
 
 
+def _format_route_details_text(details: dict[str, Any]) -> str:
+    route: Route = details["route"]
+    photos: list[dict[str, Any]] = details["photos"]
+    completions_count: int = details["completions_count"]
+    pending_count: int = details["pending_count"]
+    user_status: Optional[str] = details["user_status"]
+
+    climber_word = "climber" if completions_count == 1 else "climbers"
+    lines = [
+        f"🧗 Route #{route.id}: {route.name}",
+        f"📍 Location: {route.category or 'Uncategorized'}",
+        f"🏆 Points: {route.points} pts",
+        f"📌 Status: {'Active' if route.active else 'Inactive (archived)'}",
+        f"🏅 Completions: {completions_count} {climber_word}",
+        f"📸 Pictures: {len(photos)}",
+    ]
+    if pending_count > 0:
+        lines.append(f"⏳ Pending submissions: {pending_count}")
+    if user_status == "approved":
+        lines.append("✅ Your status: Completed")
+    elif user_status == "pending":
+        lines.append("⏳ Your status: Pending review")
+    elif route.active:
+        lines.append(f"📝 Your status: Not submitted yet (use /submit {route.id})")
+    return "\n".join(lines)
+
+
+async def _send_route_details(
+    message: Any, store: LeagueStore, route_id: int, user_id: Optional[int]
+) -> None:
+    details = store.get_route_details(route_id, telegram_id=user_id)
+    if details is None:
+        await message.reply_text(f"Route #{route_id} not found.")
+        return
+
+    info_text = _format_route_details_text(details)
+    photos = details["photos"]
+    if not photos:
+        await _reply_chunked(message, info_text)
+        return
+
+    caption_fits = len(info_text) <= MAX_TELEGRAM_CAPTION_LENGTH
+    try:
+        if len(photos) == 1:
+            photo = photos[0]
+            caption = info_text if caption_fits else None
+            if photo["media_type"] == "document":
+                await message.reply_document(document=photo["file_id"], caption=caption)
+            else:
+                await message.reply_photo(photo=photo["file_id"], caption=caption)
+            if not caption_fits:
+                await _reply_chunked(message, info_text)
+            return
+
+        media_types = {p["media_type"] for p in photos}
+        if len(media_types) == 1:
+            only_type = next(iter(media_types))
+            for idx in range(0, len(photos), MAX_MEDIA_GROUP_SIZE):
+                batch = photos[idx : idx + MAX_MEDIA_GROUP_SIZE]
+                media_items = []
+                for pos, item in enumerate(batch):
+                    cap = info_text if (idx == 0 and pos == 0 and caption_fits) else None
+                    if only_type == "document":
+                        media_items.append(InputMediaDocument(media=item["file_id"], caption=cap))
+                    else:
+                        media_items.append(InputMediaPhoto(media=item["file_id"], caption=cap))
+                await message.reply_media_group(media=media_items)
+            if not caption_fits:
+                await _reply_chunked(message, info_text)
+            return
+
+        # Mixed photo and document attachments: send details text then each picture.
+        await _reply_chunked(message, info_text)
+        for item in photos:
+            if item["media_type"] == "document":
+                await message.reply_document(document=item["file_id"])
+            else:
+                await message.reply_photo(photo=item["file_id"])
+    except Exception:
+        LOGGER.warning("Failed to send pictures for route %s", route_id)
+        await _reply_chunked(
+            message, f"{info_text}\n\n⚠️ Could not load route picture(s)."
+        )
+
+
+async def route_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_message:
+        return
+    store = _store(context)
+    if not context.args:
+        active_routes = store.list_routes(active_only=True)
+        if not active_routes:
+            await update.effective_message.reply_text("No active routes have been published yet.")
+            return
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    f"#{r.id} {r.name} ({r.points} pts"
+                    + (f" · {r.category}" if r.category else "")
+                    + ")",
+                    callback_data=f"route:view:{r.id}",
+                )
+            ]
+            for r in active_routes[:25]
+        ]
+        await update.effective_message.reply_text(
+            "Select a route to view its full info & pictures (or use /route <route_id>):",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    route_id = _parse_positive_int(context.args[0], strip_hash=True)
+    if route_id is None or len(context.args) > 1:
+        await update.effective_message.reply_text("Usage: /route <route_id>")
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+    await _send_route_details(update.effective_message, store, route_id, user_id)
+
+
+async def route_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    data = query.data or ""
+    parts = data.split(":")
+    if len(parts) != 3 or parts[0] != "route" or parts[1] != "view":
+        await query.answer("Invalid route selection.", show_alert=True)
+        return
+    route_id = _parse_positive_int(parts[2])
+    if route_id is None:
+        await query.answer("Invalid route ID.", show_alert=True)
+        return
+    await query.answer()
+    if query.message:
+        user_id = update.effective_user.id if update.effective_user else None
+        await _send_route_details(query.message, _store(context), route_id, user_id)
+
+
 def _video_prompt_for_route(route: Route) -> str:
+    cat_part = f" · {route.category}" if route.category else ""
     return (
-        f"🎥 Send one video proving you climbed '{route.name}' ({route.points} points).\n\n"
+        f"🎥 Send one video proving you climbed '{route.name}' ({route.points} points{cat_part}).\n\n"
         "Make sure your video clearly shows:\n"
         "• Controlled start on the starting holds\n"
         "• Full ascent without off-route dabs\n"
@@ -823,7 +1271,7 @@ async def _validate_and_prepare_route_submission(
 async def submit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.effective_user or not update.effective_message:
         return ConversationHandler.END
-    context.user_data.pop("full_name", None)
+    _clear_conversation_data(context)
     store = _store(context)
     user_id = update.effective_user.id
     if not store.is_registered(user_id):
@@ -843,7 +1291,12 @@ async def submit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 "You have already completed or submitted all active routes! 🎉"
             )
             return ConversationHandler.END
-        route_lines = "\n".join(f"#{r.id}: {r.name} ({r.points} pts)" for r in open_routes)
+        route_lines = "\n".join(
+            f"#{r.id}: {r.name} ({r.points} pts"
+            + (f" · {r.category}" if r.category else "")
+            + ")"
+            for r in open_routes
+        )
         await _reply_chunked(
             update.effective_message,
             f"Which route are you submitting for?\n\n{route_lines}\n\n"
@@ -1062,16 +1515,14 @@ async def receive_proof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.pop("route_id", None)
-    context.user_data.pop("full_name", None)
+    _clear_conversation_data(context)
     if update.effective_message:
         await update.effective_message.reply_text("Cancelled.")
     return ConversationHandler.END
 
 
 async def cancel_idle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.pop("route_id", None)
-    context.user_data.pop("full_name", None)
+    _clear_conversation_data(context)
     if update.effective_message:
         await update.effective_message.reply_text("No active action to cancel.")
 
@@ -1113,22 +1564,613 @@ async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 
-async def add_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+_ADDROUTE_USAGE = (
+    "Usage:\n"
+    "• Interactive (with category & pictures): /addroute\n"
+    "• Quick publish: /addroute <name> <points> [category]\n"
+    "• Pipe format: /addroute <category> | <name> | <points>\n"
+    f"Categories: {', '.join(ROUTE_CATEGORIES)}"
+)
+
+
+def _parse_addroute_args(raw_args: str) -> Optional[tuple[str, int, Optional[str]]]:
+    """Parses direct /addroute arguments into (name, points, category) or None if invalid."""
+    cleaned = raw_args.strip()
+    if not cleaned:
+        return None
+
+    if "|" in cleaned:
+        parts = [_sanitize_single_line(part) for part in cleaned.split("|")]
+        if len(parts) == 2:
+            name, points_str = parts
+            points = _parse_positive_int(points_str)
+            if name and points is not None:
+                return name, points, None
+            return None
+        if len(parts) == 3:
+            first, middle, last = parts
+            cat_first = normalize_route_category(first)
+            pts_last = _parse_positive_int(last)
+            if cat_first is not None and middle and pts_last is not None:
+                return middle, pts_last, cat_first
+            cat_last = normalize_route_category(last)
+            pts_mid = _parse_positive_int(middle)
+            if first and pts_mid is not None and cat_last is not None:
+                return first, pts_mid, cat_last
+            return None
+        return None
+
+    tokens = cleaned.split()
+    if len(tokens) < 2:
+        return None
+
+    points = _parse_positive_int(tokens[-1])
+    if points is not None:
+        name = _sanitize_single_line(" ".join(tokens[:-1]))
+        if name:
+            return name, points, None
+
+    for cat_len in (2, 1):
+        if len(tokens) >= cat_len + 2:
+            cat = normalize_route_category(" ".join(tokens[-cat_len:]))
+            pts = _parse_positive_int(tokens[-cat_len - 1])
+            name = _sanitize_single_line(" ".join(tokens[: -cat_len - 1]))
+            if cat is not None and pts is not None and name:
+                return name, pts, cat
+
+    return None
+
+
+def _addroute_category_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(ROUTE_CATEGORIES[0], callback_data="addroute:cat:0"),
+                InlineKeyboardButton(ROUTE_CATEGORIES[1], callback_data="addroute:cat:1"),
+            ],
+            [
+                InlineKeyboardButton(ROUTE_CATEGORIES[2], callback_data="addroute:cat:2"),
+                InlineKeyboardButton(ROUTE_CATEGORIES[3], callback_data="addroute:cat:3"),
+            ],
+            [InlineKeyboardButton("Cancel ❌", callback_data="addroute:cancel")],
+        ]
+    )
+
+
+def _addroute_photos_keyboard(photo_count: int) -> InlineKeyboardMarkup:
+    done_label = "Publish Route ✅" if photo_count > 0 else "Skip Pictures & Publish ✅"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(done_label, callback_data="addroute:done"),
+                InlineKeyboardButton("Cancel ❌", callback_data="addroute:cancel"),
+            ]
+        ]
+    )
+
+
+def _format_published_message(
+    route_id: int, category: Optional[str], points: int, photo_count: int
+) -> str:
+    if category is None and photo_count == 0:
+        return f"Route #{route_id} published."
+    details: list[str] = []
+    if category is not None:
+        details.append(category)
+    details.append(f"{points} pts")
+    if photo_count > 0:
+        pic_word = "picture" if photo_count == 1 else "pictures"
+        details.append(f"{photo_count} {pic_word}")
+    return f"Route #{route_id} published ({', '.join(details)})."
+
+
+def _extract_command_and_args(
+    text: str, bot_username: Optional[str]
+) -> Optional[tuple[str, str]]:
+    """Extracts (base_command, rest_of_text) if text starts with /cmd[@bot]."""
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return None
+    parts = stripped.split(maxsplit=1)
+    cmd_token = parts[0][1:]
+    rest = parts[1] if len(parts) > 1 else ""
+    if "@" in cmd_token:
+        cmd_name, target_bot = cmd_token.split("@", 1)
+        if bot_username and target_bot.lower() != bot_username.lower():
+            return None
+    else:
+        cmd_name = cmd_token
+    return cmd_name.lower(), rest
+
+
+async def _start_interactive_addroute(
+    message: Any, context: ContextTypes.DEFAULT_TYPE, initial_photo: Optional[tuple[str, str]]
+) -> int:
+    _clear_conversation_data(context)
+    photos = [initial_photo] if initial_photo is not None else []
+    context.user_data["addroute_photos"] = photos
+    prefix = "📸 Initial picture saved.\n\n" if photos else ""
+    await message.reply_text(
+        f"{prefix}📍 Where is this route located?\n"
+        "Choose a category below (or type one: Arkose, ENSTA gym, Pan, Outdoors), or /cancel:",
+        reply_markup=_addroute_category_keyboard(),
+    )
+    return ADDROUTE_CATEGORY
+
+
+async def add_route_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.effective_message:
+        return ConversationHandler.END
+    if not _is_admin(update):
+        await update.effective_message.reply_text("Admin access required.")
+        return ConversationHandler.END
+
+    raw_args = " ".join(context.args) if context.args else ""
+    if not raw_args:
+        return await _start_interactive_addroute(update.effective_message, context, None)
+
+    parsed = _parse_addroute_args(raw_args)
+    if parsed is None:
+        await update.effective_message.reply_text(_ADDROUTE_USAGE)
+        return ConversationHandler.END
+
+    _clear_conversation_data(context)
+    name, points, category = parsed
+    route_id = _store(context).add_route(name, points, category=category)
+    await update.effective_message.reply_text(
+        _format_published_message(route_id, category, points, 0)
+    )
+    return ConversationHandler.END
+
+
+async def add_route_caption_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.effective_message:
+        return ConversationHandler.END
+    message = update.effective_message
+    bot_username = getattr(context.bot, "username", None)
+    parsed_cmd = _extract_command_and_args(message.caption or "", bot_username)
+    if parsed_cmd is None or parsed_cmd[0] != "addroute":
+        return ConversationHandler.END
+
+    if not _is_admin(update):
+        await message.reply_text("Admin access required.")
+        return ConversationHandler.END
+
+    photo_info = _extract_photo_info(message)
+    if photo_info is None:
+        await message.reply_text("Please attach a valid image/photo.")
+        return ConversationHandler.END
+    file_id, media_type = photo_info
+
+    raw_args = parsed_cmd[1].strip()
+    if not raw_args:
+        return await _start_interactive_addroute(message, context, (media_type, file_id))
+
+    parsed = _parse_addroute_args(raw_args)
+    if parsed is None:
+        await message.reply_text(_ADDROUTE_USAGE)
+        return ConversationHandler.END
+
+    _clear_conversation_data(context)
+    name, points, category = parsed
+    route_id = _store(context).add_route(
+        name, points, category=category, photos=[(media_type, file_id)]
+    )
+    await message.reply_text(_format_published_message(route_id, category, points, 1))
+    return ConversationHandler.END
+
+
+async def addroute_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    if not _is_admin(update):
+        await query.answer("Admin access required.", show_alert=True)
+        return ConversationHandler.END
+
+    data = query.data or ""
+    if data == "addroute:cancel":
+        _clear_conversation_data(context)
+        await query.answer("Cancelled.")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        if query.message:
+            await query.message.reply_text("Cancelled.")
+        return ConversationHandler.END
+
+    parts = data.split(":")
+    if len(parts) != 3 or parts[0] != "addroute" or parts[1] != "cat":
+        await query.answer("Invalid category selection.", show_alert=True)
+        return ADDROUTE_CATEGORY
+
+    try:
+        idx = int(parts[2])
+        category = ROUTE_CATEGORIES[idx]
+    except (ValueError, IndexError):
+        await query.answer("Invalid category selection.", show_alert=True)
+        return ADDROUTE_CATEGORY
+
+    context.user_data["addroute_category"] = category
+    await query.answer(f"Selected {category}")
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if query.message:
+        await query.message.reply_text(
+            f"📍 Category: {category}\nWhat is the route name? (or /cancel)"
+        )
+    return ADDROUTE_NAME
+
+
+async def addroute_category_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.effective_message:
+        return ConversationHandler.END
+    raw = (update.effective_message.text or "").strip()
+    category: Optional[str] = None
+    if raw.isascii() and raw.isdigit():
+        idx = int(raw) - 1
+        if 0 <= idx < len(ROUTE_CATEGORIES):
+            category = ROUTE_CATEGORIES[idx]
+    else:
+        category = normalize_route_category(raw)
+
+    if category is None:
+        await update.effective_message.reply_text(
+            f"Please choose one of: {', '.join(ROUTE_CATEGORIES)} (or tap a button above), or /cancel."
+        )
+        return ADDROUTE_CATEGORY
+
+    context.user_data["addroute_category"] = category
+    await update.effective_message.reply_text(
+        f"📍 Category: {category}\nWhat is the route name? (or /cancel)"
+    )
+    return ADDROUTE_NAME
+
+
+async def addroute_category_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            f"Please choose a category ({', '.join(ROUTE_CATEGORIES)}), or /cancel."
+        )
+    return ADDROUTE_CATEGORY
+
+
+async def addroute_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.effective_message:
+        return ConversationHandler.END
+    name = _sanitize_single_line(update.effective_message.text or "")
+    if not name:
+        await update.effective_message.reply_text("Please enter a valid route name, or /cancel.")
+        return ADDROUTE_NAME
+    context.user_data["addroute_name"] = name
+    await update.effective_message.reply_text(
+        f"How many points is '{name}' worth? (positive integer, or /cancel)"
+    )
+    return ADDROUTE_POINTS
+
+
+async def addroute_name_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_message:
+        await update.effective_message.reply_text("Please send the route name as text, or /cancel.")
+    return ADDROUTE_NAME
+
+
+async def addroute_points(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.effective_message:
+        return ConversationHandler.END
+    points = _parse_positive_int(update.effective_message.text or "")
+    if points is None:
+        await update.effective_message.reply_text(
+            "Please enter a valid positive whole number for points (e.g. 20), or /cancel."
+        )
+        return ADDROUTE_POINTS
+
+    context.user_data["addroute_points"] = points
+    existing_photos = context.user_data.setdefault("addroute_photos", [])
+    photo_count = len(existing_photos)
+    if photo_count > 0:
+        prompt = (
+            f"📸 {photo_count} picture(s) already attached.\n"
+            "Send more pictures if you'd like, or tap Publish Route ✅ (or send /done) to publish."
+        )
+    else:
+        prompt = (
+            "📸 Send one or more pictures of the route.\n"
+            "When finished, tap Publish Route ✅ (or send /done, or /skip for no pictures)."
+        )
+    await update.effective_message.reply_text(
+        prompt, reply_markup=_addroute_photos_keyboard(photo_count)
+    )
+    return ADDROUTE_PHOTOS
+
+
+async def addroute_points_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "Please enter the points as a positive number, or /cancel."
+        )
+    return ADDROUTE_POINTS
+
+
+async def addroute_receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.effective_message:
+        return ConversationHandler.END
+    photo_info = _extract_photo_info(update.effective_message)
+    if photo_info is None:
+        await update.effective_message.reply_text(
+            "Please send a picture (photo), or send /done (or /skip) to publish, or /cancel."
+        )
+        return ADDROUTE_PHOTOS
+    file_id, media_type = photo_info
+    photos: list[tuple[str, str]] = context.user_data.setdefault("addroute_photos", [])
+    photos.append((media_type, file_id))
+    count = len(photos)
+    await update.effective_message.reply_text(
+        f"📸 Picture #{count} added. Send another picture, or send /done (or tap Publish Route ✅) to publish.",
+        reply_markup=_addroute_photos_keyboard(count),
+    )
+    return ADDROUTE_PHOTOS
+
+
+async def _finalize_addroute(
+    message: Any, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    category = context.user_data.get("addroute_category")
+    name = context.user_data.get("addroute_name")
+    points = context.user_data.get("addroute_points")
+    photos: list[tuple[str, str]] = list(context.user_data.get("addroute_photos") or [])
+    _clear_conversation_data(context)
+
+    if not name or points is None:
+        await message.reply_text("Route creation session expired. Please run /addroute again.")
+        return ConversationHandler.END
+
+    route_id = _store(context).add_route(
+        name, int(points), category=category, photos=photos
+    )
+    await message.reply_text(
+        _format_published_message(route_id, category, int(points), len(photos))
+    )
+    return ConversationHandler.END
+
+
+async def addroute_photos_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.effective_message:
+        return ConversationHandler.END
+    return await _finalize_addroute(update.effective_message, context)
+
+
+async def addroute_photos_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    if not _is_admin(update):
+        await query.answer("Admin access required.", show_alert=True)
+        return ConversationHandler.END
+
+    data = query.data or ""
+    if data == "addroute:cancel":
+        _clear_conversation_data(context)
+        await query.answer("Cancelled.")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        if query.message:
+            await query.message.reply_text("Cancelled.")
+        return ConversationHandler.END
+
+    if data == "addroute:done":
+        await query.answer("Publishing route...")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        if query.message:
+            return await _finalize_addroute(query.message, context)
+        _clear_conversation_data(context)
+        return ConversationHandler.END
+
+    await query.answer("Invalid action.", show_alert=True)
+    return ADDROUTE_PHOTOS
+
+
+async def addroute_photos_invalid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "Please send a picture (photo), or send /done (or /skip) to publish, or /cancel."
+        )
+    return ADDROUTE_PHOTOS
+
+
+async def stale_addroute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    if not _is_admin(update):
+        await query.answer("Admin access required.", show_alert=True)
+        return
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await query.answer("This prompt has expired. Please run the command again.", show_alert=True)
+
+
+async def add_route_photo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.effective_message:
+        return ConversationHandler.END
+    if not _is_admin(update):
+        await update.effective_message.reply_text("Admin access required.")
+        return ConversationHandler.END
+    if not context.args or len(context.args) != 1:
+        await update.effective_message.reply_text("Usage: /addroutephoto <route_id>")
+        return ConversationHandler.END
+    route_id = _parse_positive_int(context.args[0], strip_hash=True)
+    if route_id is None:
+        await update.effective_message.reply_text("Usage: /addroutephoto <route_id>")
+        return ConversationHandler.END
+    route = _store(context).get_route(route_id)
+    if route is None:
+        await update.effective_message.reply_text(f"Route #{route_id} not found.")
+        return ConversationHandler.END
+
+    _clear_conversation_data(context)
+    context.user_data["addroutephoto_id"] = route_id
+    context.user_data["addroutephoto_count"] = 0
+    await update.effective_message.reply_text(
+        f"📸 Send picture(s) to attach to Route #{route.id} ('{route.name}').\n"
+        "Send /done (or tap Done ✅) when finished, or /cancel.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Done ✅", callback_data="addroutephoto:done")]]
+        ),
+    )
+    return ADDROUTEPHOTO_WAIT
+
+
+async def add_route_photo_caption_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.effective_message:
+        return ConversationHandler.END
+    message = update.effective_message
+    bot_username = getattr(context.bot, "username", None)
+    parsed_cmd = _extract_command_and_args(message.caption or "", bot_username)
+    if parsed_cmd is None or parsed_cmd[0] != "addroutephoto":
+        return ConversationHandler.END
+    if not _is_admin(update):
+        await message.reply_text("Admin access required.")
+        return ConversationHandler.END
+
+    arg_tokens = parsed_cmd[1].split()
+    if len(arg_tokens) != 1:
+        await message.reply_text("Usage: /addroutephoto <route_id>")
+        return ConversationHandler.END
+    route_id = _parse_positive_int(arg_tokens[0], strip_hash=True)
+    if route_id is None:
+        await message.reply_text("Usage: /addroutephoto <route_id>")
+        return ConversationHandler.END
+    store = _store(context)
+    route = store.get_route(route_id)
+    if route is None:
+        await message.reply_text(f"Route #{route_id} not found.")
+        return ConversationHandler.END
+
+    photo_info = _extract_photo_info(message)
+    if photo_info is None:
+        await message.reply_text("Please attach a valid image/photo.")
+        return ConversationHandler.END
+    file_id, media_type = photo_info
+    store.add_route_photo(route_id, file_id, media_type=media_type)
+    total = len(store.get_route_photos(route_id))
+    await message.reply_text(
+        f"📸 Picture added to Route #{route.id} ('{route.name}'). Total pictures: {total}."
+    )
+    return ConversationHandler.END
+
+
+async def addroutephoto_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.effective_message:
+        return ConversationHandler.END
+    route_id = context.user_data.get("addroutephoto_id")
+    if route_id is None:
+        await update.effective_message.reply_text("Session expired. Please run /addroutephoto again.")
+        return ConversationHandler.END
+    photo_info = _extract_photo_info(update.effective_message)
+    if photo_info is None:
+        await update.effective_message.reply_text(
+            "Please send a picture (photo), or send /done when finished, or /cancel."
+        )
+        return ADDROUTEPHOTO_WAIT
+    file_id, media_type = photo_info
+    store = _store(context)
+    store.add_route_photo(int(route_id), file_id, media_type=media_type)
+    added = int(context.user_data.get("addroutephoto_count", 0)) + 1
+    context.user_data["addroutephoto_count"] = added
+    total = len(store.get_route_photos(int(route_id)))
+    await update.effective_message.reply_text(
+        f"📸 Picture added (#{added} in this batch, {total} total). Send more or /done.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Done ✅", callback_data="addroutephoto:done")]]
+        ),
+    )
+    return ADDROUTEPHOTO_WAIT
+
+
+async def addroutephoto_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    route_id = context.user_data.get("addroutephoto_id")
+    added = int(context.user_data.get("addroutephoto_count", 0))
+    _clear_conversation_data(context)
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            f"Finished adding {added} picture(s) to Route #{route_id}."
+            if route_id is not None
+            else "Done."
+        )
+    return ConversationHandler.END
+
+
+async def addroutephoto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    if not _is_admin(update):
+        await query.answer("Admin access required.", show_alert=True)
+        return ConversationHandler.END
+    route_id = context.user_data.get("addroutephoto_id")
+    added = int(context.user_data.get("addroutephoto_count", 0))
+    _clear_conversation_data(context)
+    await query.answer("Done.")
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if query.message:
+        await query.message.reply_text(
+            f"Finished adding {added} picture(s) to Route #{route_id}."
+            if route_id is not None
+            else "Done."
+        )
+    return ConversationHandler.END
+
+
+async def addroutephoto_invalid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "Please send a picture (photo), or send /done when finished, or /cancel."
+        )
+    return ADDROUTEPHOTO_WAIT
+
+
+async def set_route_category_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message:
         return
     if not _is_admin(update):
         await update.effective_message.reply_text("Admin access required.")
         return
     if not context.args or len(context.args) < 2:
-        await update.effective_message.reply_text("Usage: /addroute <name> <points>")
+        await update.effective_message.reply_text(
+            f"Usage: /setroutecategory <route_id> <category>\nCategories: {', '.join(ROUTE_CATEGORIES)}"
+        )
         return
-    points = _parse_positive_int(context.args[-1])
-    name = _sanitize_single_line(" ".join(context.args[:-1]))
-    if points is None or not name:
-        await update.effective_message.reply_text("Usage: /addroute <name> <points>")
+    route_id = _parse_positive_int(context.args[0], strip_hash=True)
+    raw_cat = " ".join(context.args[1:])
+    category = normalize_route_category(raw_cat)
+    if route_id is None or category is None:
+        await update.effective_message.reply_text(
+            f"Usage: /setroutecategory <route_id> <category>\nCategories: {', '.join(ROUTE_CATEGORIES)}"
+        )
         return
-    route_id = _store(context).add_route(name, points)
-    await update.effective_message.reply_text(f"Route #{route_id} published.")
+    store = _store(context)
+    route = store.get_route(route_id)
+    if route is None:
+        await update.effective_message.reply_text(f"Route #{route_id} not found.")
+        return
+    store.set_route_category(route_id, category)
+    await update.effective_message.reply_text(
+        f"Route #{route_id} ('{route.name}') category set to {category}."
+    )
 
 
 async def toggle_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1475,20 +2517,31 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.effective_message:
         return
     store = _store(context)
+    is_admin = _is_admin(update)
     info = store.get_student_profile(update.effective_user.id)
     if not info:
-        await update.effective_message.reply_text(
-            "You are not registered yet. Use /register to join the league!"
-        )
+        if is_admin:
+            await update.effective_message.reply_text(
+                "🛡️ Role: Admin (you have full admin rights — use /admin to view admin commands).\n\n"
+                "You are not registered as a climber yet. Use /register if you also want to join the league!"
+            )
+        else:
+            await update.effective_message.reply_text(
+                "You are not registered yet. Use /register to join the league!"
+            )
         return
 
     top_word = "top" if info["tops"] == 1 else "tops"
-    lines = [
-        f"🧗 Climber Profile: {info['full_name']}",
-        f"Email: {info['email']}",
-        f"Rank: #{info['rank']} of {info['total_students']}",
-        f"Score: {info['points']} pts ({info['tops']} {top_word})",
-    ]
+    lines = [f"🧗 Climber Profile: {info['full_name']}"]
+    if is_admin:
+        lines.append("Role: 🛡️ Admin (full admin rights)")
+    lines.extend(
+        [
+            f"Email: {info['email']}",
+            f"Rank: #{info['rank']} of {info['total_students']}",
+            f"Score: {info['points']} pts ({info['tops']} {top_word})",
+        ]
+    )
 
     if info["approved_routes"]:
         lines.append("\n✅ Completed Routes:")
@@ -1617,12 +2670,14 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _post_init(application: Application) -> None:
     commands = [
-        BotCommand("routes", "View active climbing routes & progress"),
+        BotCommand("routes", "View climbing routes & categories"),
+        BotCommand("route", "View full info & pictures of a route"),
         BotCommand("submit", "Submit video proof for a route"),
         BotCommand("withdraw", "Withdraw a pending submission"),
         BotCommand("leaderboard", "View league rankings"),
         BotCommand("profile", "View your personal score and completed routes"),
         BotCommand("register", "Register or update your profile"),
+        BotCommand("admin", "Check admin status & admin commands"),
         BotCommand("help", "View competition rules and commands"),
         BotCommand("cancel", "Cancel current action"),
     ]
@@ -1653,46 +2708,124 @@ def build_application(
     token: str, database_path: str | Path = "climbx_league.sqlite3"
 ) -> Application:
     store = LeagueStore(database_path)
-    conversation = ConversationHandler(
-        entry_points=[
-            CommandHandler("register", register_start, filters=_MSG_COMMAND_FILTER),
-            CommandHandler("submit", submit_start, filters=_MSG_COMMAND_FILTER),
-        ],
-        states={
-            REGISTER_NAME: [
-                MessageHandler(
-                    _MSG_COMMAND_FILTER & filters.TEXT & ~filters.COMMAND, register_name
-                ),
-                MessageHandler(
-                    _MSG_COMMAND_FILTER & ~filters.TEXT & ~filters.COMMAND,
-                    register_name_non_text,
-                ),
+    addroute_caption_filter = _MSG_COMMAND_FILTER & (
+        filters.PHOTO | filters.Document.IMAGE
+    ) & filters.CaptionRegex(r"^/addroute(@\w+)?(\s|$)")
+    addroutephoto_caption_filter = _MSG_COMMAND_FILTER & (
+        filters.PHOTO | filters.Document.IMAGE
+    ) & filters.CaptionRegex(r"^/addroutephoto(@\w+)?(\s|$)")
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"If 'per_message=False'",
+            category=PTBUserWarning,
+        )
+        conversation = ConversationHandler(
+            entry_points=[
+                CommandHandler("register", register_start, filters=_MSG_COMMAND_FILTER),
+                CommandHandler("submit", submit_start, filters=_MSG_COMMAND_FILTER),
+                CommandHandler("addroute", add_route_entry, filters=_MSG_COMMAND_FILTER),
+                MessageHandler(addroute_caption_filter, add_route_caption_entry),
+                CommandHandler("addroutephoto", add_route_photo_cmd, filters=_MSG_COMMAND_FILTER),
+                MessageHandler(addroutephoto_caption_filter, add_route_photo_caption_entry),
             ],
-            REGISTER_EMAIL: [
-                MessageHandler(
-                    _MSG_COMMAND_FILTER & filters.TEXT & ~filters.COMMAND, register_email
-                ),
-                MessageHandler(
-                    _MSG_COMMAND_FILTER & ~filters.TEXT & ~filters.COMMAND,
-                    register_email_non_text,
-                ),
-            ],
-            SUBMIT_ROUTE: [
-                MessageHandler(
-                    _MSG_COMMAND_FILTER & filters.TEXT & ~filters.COMMAND, submit_select_route
-                ),
-                MessageHandler(
-                    _MSG_COMMAND_FILTER & ~filters.TEXT & ~filters.COMMAND,
-                    submit_select_route_non_text,
-                ),
-            ],
-            SUBMIT_PROOF: [
-                MessageHandler(_MSG_COMMAND_FILTER & filters.ALL & ~filters.COMMAND, receive_proof)
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel, filters=_MSG_COMMAND_FILTER)],
-        allow_reentry=True,
-    )
+            states={
+                REGISTER_NAME: [
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER & filters.TEXT & ~filters.COMMAND, register_name
+                    ),
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER & ~filters.TEXT & ~filters.COMMAND,
+                        register_name_non_text,
+                    ),
+                ],
+                REGISTER_EMAIL: [
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER & filters.TEXT & ~filters.COMMAND, register_email
+                    ),
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER & ~filters.TEXT & ~filters.COMMAND,
+                        register_email_non_text,
+                    ),
+                ],
+                SUBMIT_ROUTE: [
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER & filters.TEXT & ~filters.COMMAND, submit_select_route
+                    ),
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER & ~filters.TEXT & ~filters.COMMAND,
+                        submit_select_route_non_text,
+                    ),
+                ],
+                SUBMIT_PROOF: [
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER & filters.ALL & ~filters.COMMAND, receive_proof
+                    )
+                ],
+                ADDROUTE_CATEGORY: [
+                    CallbackQueryHandler(addroute_category_callback, pattern=r"^addroute:(cat:[0-9]+|cancel)$"),
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER & filters.TEXT & ~filters.COMMAND,
+                        addroute_category_text,
+                    ),
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER & ~filters.TEXT & ~filters.COMMAND,
+                        addroute_category_non_text,
+                    ),
+                ],
+                ADDROUTE_NAME: [
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER & filters.TEXT & ~filters.COMMAND, addroute_name
+                    ),
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER & ~filters.TEXT & ~filters.COMMAND,
+                        addroute_name_non_text,
+                    ),
+                ],
+                ADDROUTE_POINTS: [
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER & filters.TEXT & ~filters.COMMAND, addroute_points
+                    ),
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER & ~filters.TEXT & ~filters.COMMAND,
+                        addroute_points_non_text,
+                    ),
+                ],
+                ADDROUTE_PHOTOS: [
+                    CallbackQueryHandler(
+                        addroute_photos_callback, pattern=r"^addroute:(done|cancel)$"
+                    ),
+                    CommandHandler(["done", "skip"], addroute_photos_done, filters=_MSG_COMMAND_FILTER),
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER
+                        & (filters.PHOTO | filters.Document.IMAGE)
+                        & ~filters.COMMAND,
+                        addroute_receive_photo,
+                    ),
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER & filters.ALL & ~filters.COMMAND,
+                        addroute_photos_invalid,
+                    ),
+                ],
+                ADDROUTEPHOTO_WAIT: [
+                    CallbackQueryHandler(addroutephoto_callback, pattern=r"^addroutephoto:done$"),
+                    CommandHandler("done", addroutephoto_done, filters=_MSG_COMMAND_FILTER),
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER
+                        & (filters.PHOTO | filters.Document.IMAGE)
+                        & ~filters.COMMAND,
+                        addroutephoto_receive,
+                    ),
+                    MessageHandler(
+                        _MSG_COMMAND_FILTER & filters.ALL & ~filters.COMMAND,
+                        addroutephoto_invalid,
+                    ),
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", cancel, filters=_MSG_COMMAND_FILTER)],
+            allow_reentry=True,
+        )
     application = (
         ApplicationBuilder()
         .token(token)
@@ -1707,11 +2840,19 @@ def build_application(
             CommandHandler("cancel", cancel_idle, filters=_MSG_COMMAND_FILTER),
             CommandHandler("start", start, filters=_MSG_COMMAND_FILTER),
             CommandHandler("help", help_command, filters=_MSG_COMMAND_FILTER),
+            CommandHandler("admin", admin_status, filters=_MSG_COMMAND_FILTER),
             CommandHandler("routes", routes, filters=_MSG_COMMAND_FILTER),
+            CommandHandler(["route", "routeinfo"], route_info, filters=_MSG_COMMAND_FILTER),
             CommandHandler("withdraw", withdraw, filters=_MSG_COMMAND_FILTER),
             CommandHandler(["profile", "me"], profile, filters=_MSG_COMMAND_FILTER),
-            CommandHandler("addroute", add_route, filters=_MSG_COMMAND_FILTER),
-            CommandHandler(["deactivateroute", "activateroute"], toggle_route, filters=_MSG_COMMAND_FILTER),
+            CommandHandler(
+                ["setroutecategory", "setcategory"],
+                set_route_category_cmd,
+                filters=_MSG_COMMAND_FILTER,
+            ),
+            CommandHandler(
+                ["deactivateroute", "activateroute"], toggle_route, filters=_MSG_COMMAND_FILTER
+            ),
             CommandHandler("pending", pending, filters=_MSG_COMMAND_FILTER),
             CommandHandler(["submission", "view"], view_submission, filters=_MSG_COMMAND_FILTER),
             CommandHandler(["approve", "reject"], review, filters=_MSG_COMMAND_FILTER),
@@ -1720,6 +2861,8 @@ def build_application(
             CommandHandler("leaderboard", leaderboard, filters=_MSG_COMMAND_FILTER),
             CommandHandler(["broadcast", "announce"], broadcast, filters=_MSG_COMMAND_FILTER),
             CallbackQueryHandler(review_callback, pattern=r"^review:(approve|reject):[0-9]+$"),
+            CallbackQueryHandler(route_view_callback, pattern=r"^route:view:[0-9]+$"),
+            CallbackQueryHandler(stale_addroute_callback, pattern=r"^(addroute|addroutephoto):"),
         ]
     )
     application.add_error_handler(_error_handler)
