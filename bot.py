@@ -1,7 +1,7 @@
 """ClimbX League Telegram bot.
 
 Run with:
-    TELEGRAM_BOT_TOKEN=... python bot.py
+    python bot.py
 
 The bot stores registration, routes, and video proof submissions in SQLite.
 Telegram video file IDs are stored instead of downloading student videos.
