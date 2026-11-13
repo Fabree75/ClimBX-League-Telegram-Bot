@@ -1,25 +1,32 @@
 # ClimbX League bot
 
-Telegram bot for the climbing league at Ecole Polytechnique. Students can register, view admin-published routes, submit photo proof of ascents, and view the live leaderboard. Admins review submissions with photo previews and inline buttons before route points count.
+Telegram bot for the climbing league at École Polytechnique. Students can register, view admin-published routes with personal progress badges, submit **video proof** of ascents, check their personal profile, and view the live leaderboard. Admins review submissions with video previews and inline buttons before route points count.
 
 ## Features
 
 - **Student Flow**:
-  - `/register`: Register name and Polytechnique email address.
-  - `/routes`: View currently active routes and points.
-  - `/submit <route_id>`: Submit a photo proof for a route. Prevents duplicate submissions if already approved or pending review. Re-submission is permitted if previously rejected.
-  - `/leaderboard`: View real-time student point rankings.
+  - `/register`: Register or update full name and Polytechnique / IP Paris email address (in private chat).
+  - `/routes`: View currently active routes, points, and your personal status (`✅ Completed`, `⏳ Pending review`) plus overall progress.
+  - `/submit [route_id]`: Submit a video proof for a route (either directly with `/submit <id>` or interactively via `/submit`). Supports regular videos, video notes, video documents, and muted videos (`animation`); rejects photo uploads with clear guidance on video proof rules. Prevents duplicate submissions if already approved or pending review, and allows re-submission if previously rejected.
+  - `/withdraw <route_id>`: Withdraw a pending submission before it is reviewed.
+  - `/profile` (or `/me`): View personal rank, total points, completed tops, and pending submissions.
+  - `/leaderboard`: View real-time rankings with podium medals (`🥇, 🥈, 🥉`), tops count tie-breaking, shared tie ranks, and personal rank summary.
+  - `/help`: View competition video rules and available commands.
   - `/cancel`: Cancel active registration or submission flow.
 
 - **Admin Moderation & Lifecycle**:
-  - **Inline Review Cards**: Admins receive instant photo previews with `[Approve ✅]` and `[Reject ❌]` inline buttons whenever a student submits proof.
-  - **Student Feedback**: Students automatically receive Telegram notifications when their climb is approved (with points awarded) or rejected.
+  - **Inline Video Review Cards**: Admins receive instant video previews with `[Approve ✅]` and `[Reject ❌]` inline buttons whenever a student submits proof; reviewing on one admin's card automatically syncs and clears buttons across all other admins' cards.
+  - **Student Feedback**: Students automatically receive Telegram notifications when their climb is approved (with points awarded) or rejected (including optional admin feedback).
   - `/addroute <name> <points>`: Publish a new climbing route.
   - `/deactivateroute <route_id>`: Deactivate an expired or retired route (prevents new submissions).
   - `/activateroute <route_id>`: Reactivate a route.
   - `/routes all`: View all routes including inactive ones.
-  - `/pending`: List pending submissions.
-  - `/approve <submission_id>` / `/reject <submission_id>`: Text commands to review submissions.
+  - `/pending`: List pending video submissions.
+  - `/submission <submission_id>` (or `/view <submission_id>`): Re-send the video preview and inline review card for any submission on demand.
+  - `/approve <submission_id>` / `/reject <submission_id> [reason]`: Text commands to review submissions (with optional rejection reason sent to the student).
+  - `/reopen <submission_id>`: Reopen an accidentally approved or rejected submission back to pending review.
+  - `/export`: Export current competition standings as a CSV file (`climbx_standings.csv`).
+  - `/broadcast <message>` (or `/announce <message>`): Broadcast an announcement to all registered climbers.
 
 ## Setup
 
@@ -37,4 +44,4 @@ Telegram bot for the climbing league at Ecole Polytechnique. Students can regist
    python bot.py
    ```
 
-The SQLite database is initialized automatically. Photo proofs use Telegram file IDs, so images are hosted directly by Telegram without storing local image files on the server.
+The SQLite database is initialized (and migrated) automatically. Video proofs use Telegram file IDs, so videos are hosted and streamed directly by Telegram without storing local video files on the server.
