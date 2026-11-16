@@ -852,18 +852,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     text = (
         "🧗 <b>ClimbX League Guide &amp; Rules</b>\n\n"
-        "<b>How to Participate:</b>\n"
+        "<b>How to participate:</b>\n"
         "1. Register once with /register.\n"
         "2. Check active routes with /routes (or filter by location: Arkose, ENSTA gym, Pan, Outdoors).\n"
         "3. Inspect full route details &amp; pictures with <code>/route &lt;route_id&gt;</code>.\n"
         "4. Record a video of your climb and submit it with <code>/submit &lt;route_id&gt;</code>.\n"
         "5. Once an admin approves your video, points are added to /leaderboard!\n\n"
-        "<b>Video Proof Requirements:</b>\n"
+        "<b>Video proof requirements:</b>\n"
         "• <b>Start</b>: Establish a controlled start with both hands on the starting holds.\n"
         "• <b>Ascent</b>: Complete the route using only allowed holds (no off-route dabs).\n"
         "• <b>Finish</b>: Match both hands on the top hold with control for 2 seconds.\n"
         "• <b>Format</b>: Must be a video (photos are not accepted).\n\n"
-        "<b>Student Commands:</b>\n"
+        "<b>Student commands:</b>\n"
         "• /register - Register or update your name &amp; email\n"
         "• <code>/routes [category]</code> - List active routes and your status (✅/⏳)\n"
         "• <code>/route [route_id]</code> - View full route info &amp; pictures\n"
@@ -871,13 +871,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• <code>/withdraw &lt;route_id&gt;</code> - Cancel a pending submission\n"
         "• /profile - View your personal stats and completed routes\n"
         "• /leaderboard - View competition rankings\n"
+        "• /admin - View your admin status &amp; rights\n"
         "• /cancel - Cancel an ongoing action"
     )
     if _is_admin(update):
         text += (
             "\n\n🛡️ <b>Admin Status:</b> You are an admin and have admin rights.\n"
-            "<b>Admin Commands:</b>\n"
-            "• /admin - View your admin status &amp; rights\n"
+            "<b>Admin commands:</b>\n"
             "• <code>/addroute</code> - Guided route creation (category, name, points, pictures)\n"
             "• <code>/addroute &lt;name&gt; &lt;points&gt; [category]</code> - Quick publish (attach photo optionally)\n"
             "• <code>/addroutephoto &lt;route_id&gt;</code> - Add picture(s) to an existing route\n"
