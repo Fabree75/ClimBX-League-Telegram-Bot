@@ -29,21 +29,32 @@ from telegram.ext import (
 from telegram.warnings import PTBUserWarning
 
 from common import (
-    ADDROUTEPHOTO_WAIT,
     ADDROUTE_CATEGORY,
     ADDROUTE_NAME,
     ADDROUTE_PHOTOS,
     ADDROUTE_POINTS,
     ADDROUTE_ZONE,
+    EDITPROFILE_CONFIRM,
+    EDITPROFILE_EMAIL,
+    EDITPROFILE_MENU,
+    EDITPROFILE_NAME,
+    EDITPROFILE_USERNAME,
+    EDITROUTE_CATEGORY,
+    EDITROUTE_MENU,
+    EDITROUTE_NAME,
+    EDITROUTE_PHOTOS,
+    EDITROUTE_POINTS,
+    EDITROUTE_SELECT,
+    EDITROUTE_ZONE,
     GUI_PROMPT_INPUT,
     MAX_MEDIA_GROUP_SIZE,
     MAX_TELEGRAM_CAPTION_LENGTH,
     MAX_TELEGRAM_MESSAGE_LENGTH,
     MSG_COMMAND_FILTER,
+    REGISTER_CONFIRM,
     REGISTER_EMAIL,
     REGISTER_NAME,
     REGISTER_USERNAME,
-    REVIEW_CUSTOM_ZONE,
     REVIEW_REJECT_REASON,
     ROUTE_CATEGORIES,
     SAFE_MESSAGE_CHUNK_LENGTH,
@@ -51,39 +62,53 @@ from common import (
     SUBMIT_PROOF,
     SUBMIT_ROUTE,
     _admin_ids,
+    _can_manage_routes,
     _clear_conversation_data,
     _compute_competition_ranks,
     _extract_command_and_args,
     _extract_photo_info,
     _extract_video_info,
     _is_admin,
+    _is_routesetter,
     _is_valid_email,
+    _menu_button_markup,
     _non_text_prompt,
     _parse_positive_int,
     _reply_chunked,
+    _routesetter_ids,
     _sanitize_single_line,
     _store,
+    _with_menu_button,
     normalize_route_category,
 )
 from handlers.general import (
-    admin_status,
     broadcast,
     cancel,
     cancel_idle,
+    commands_command,
     export_results,
     gui_callback,
     gui_conversation_entry_callback,
     gui_prompt_input_text,
-    help_command,
     leaderboard,
     menu_command,
-    mode_command,
     profile,
+    role_status,
+    rules_command,
     start,
 )
 from handlers.registration import (
+    editprofile_confirm_callback,
+    editprofile_email_text,
+    editprofile_menu_callback,
+    editprofile_name_text,
+    editprofile_start,
+    editprofile_username_text,
+    register_confirm_callback,
+    register_confirm_text,
     register_email,
     register_name,
+    register_skip_username,
     register_start,
     register_username,
     regreq_callback,
@@ -93,8 +118,6 @@ from handlers.registration import (
 from handlers.routes import (
     add_route_caption_entry,
     add_route_entry,
-    add_route_photo_caption_entry,
-    add_route_photo_cmd,
     addroute_category_callback,
     addroute_category_text,
     addroute_name,
@@ -106,16 +129,25 @@ from handlers.routes import (
     addroute_zone_non_text,
     addroute_zone_skip,
     addroute_zone_text,
-    addroutephoto_callback,
-    addroutephoto_done,
-    addroutephoto_receive,
+    edit_route_entry,
+    editroute_category_callback,
+    editroute_category_text,
+    editroute_done_cmd,
+    editroute_menu_callback,
+    editroute_name_text,
+    editroute_photos_callback,
+    editroute_photos_done,
+    editroute_points_text,
+    editroute_receive_photo,
+    editroute_select_callback,
+    editroute_select_text,
+    editroute_zone_callback,
+    editroute_zone_non_text,
+    editroute_zone_text,
     route_info,
     route_view_callback,
     routes,
-    set_route_category_cmd,
-    set_route_zone_points_cmd,
     stale_addroute_callback,
-    toggle_route,
 )
 from handlers.submissions import (
     all_submissions_cmd,
@@ -124,7 +156,6 @@ from handlers.submissions import (
     reopen_submission_cmd,
     review,
     review_callback,
-    review_custom_zone_text,
     review_prompt_entry_callback,
     review_reject_reason_text,
     submit_select_route,
@@ -138,22 +169,33 @@ from store import LeagueStore, Route
 LOGGER = logging.getLogger(__name__)
 
 __all__ = [
-    "ADDROUTEPHOTO_WAIT",
     "ADDROUTE_CATEGORY",
     "ADDROUTE_NAME",
     "ADDROUTE_PHOTOS",
     "ADDROUTE_POINTS",
     "ADDROUTE_ZONE",
+    "EDITPROFILE_CONFIRM",
+    "EDITPROFILE_EMAIL",
+    "EDITPROFILE_MENU",
+    "EDITPROFILE_NAME",
+    "EDITPROFILE_USERNAME",
+    "EDITROUTE_CATEGORY",
+    "EDITROUTE_MENU",
+    "EDITROUTE_NAME",
+    "EDITROUTE_PHOTOS",
+    "EDITROUTE_POINTS",
+    "EDITROUTE_SELECT",
+    "EDITROUTE_ZONE",
     "GUI_PROMPT_INPUT",
     "LeagueStore",
     "MAX_MEDIA_GROUP_SIZE",
     "MAX_TELEGRAM_CAPTION_LENGTH",
     "MAX_TELEGRAM_MESSAGE_LENGTH",
     "MSG_COMMAND_FILTER",
+    "REGISTER_CONFIRM",
     "REGISTER_EMAIL",
     "REGISTER_NAME",
     "REGISTER_USERNAME",
-    "REVIEW_CUSTOM_ZONE",
     "REVIEW_REJECT_REASON",
     "ROUTE_CATEGORIES",
     "Route",
@@ -162,39 +204,49 @@ __all__ = [
     "SUBMIT_PROOF",
     "SUBMIT_ROUTE",
     "_admin_ids",
+    "_can_manage_routes",
     "_clear_conversation_data",
     "_compute_competition_ranks",
     "_extract_command_and_args",
     "_extract_photo_info",
     "_extract_video_info",
     "_is_admin",
+    "_is_routesetter",
     "_is_valid_email",
+    "_menu_button_markup",
     "_parse_positive_int",
     "_reply_chunked",
+    "_routesetter_ids",
     "_sanitize_single_line",
     "_store",
+    "_with_menu_button",
     "build_application",
+    "commands_command",
+    "edit_route_entry",
+    "editprofile_start",
     "main",
     "normalize_route_category",
     "receive_proof",
+    "role_status",
     "routes",
-    "toggle_route",
+    "rules_command",
 ]
 
 
 async def _post_init(application: Application) -> None:
     commands = [
-        BotCommand("menu", "Open interactive button GUI"),
-        BotCommand("mode", "Toggle between GUI buttons and slash commands"),
+        BotCommand("menu", "Open interactive role-based GUI menus"),
         BotCommand("routes", "View climbing routes & categories"),
         BotCommand("route", "View full info & pictures of a route"),
         BotCommand("submit", "Submit video proof for a route"),
         BotCommand("withdraw", "Withdraw a pending submission"),
         BotCommand("leaderboard", "View league rankings"),
         BotCommand("profile", "View your personal score and completed routes"),
-        BotCommand("register", "Register or request a profile update"),
-        BotCommand("admin", "Check admin status & admin commands"),
-        BotCommand("help", "View competition rules and commands"),
+        BotCommand("editprofile", "Edit your username or request profile changes"),
+        BotCommand("register", "Join the league (@polytechnique.edu)"),
+        BotCommand("role", "Check your role (Climber, Routesetter, Admin)"),
+        BotCommand("rules", "View competition rules & video proof requirements"),
+        BotCommand("commands", "View available slash commands for your role"),
         BotCommand("cancel", "Cancel current action"),
     ]
     try:
@@ -229,9 +281,6 @@ def build_application(
     store = LeagueStore(database_path)
     image_filter = MSG_COMMAND_FILTER & (filters.PHOTO | filters.Document.IMAGE)
     addroute_caption_filter = image_filter & filters.CaptionRegex(r"^/addroute(@\w+)?(\s|$)")
-    addroutephoto_caption_filter = image_filter & filters.CaptionRegex(
-        r"^/addroutephoto(@\w+)?(\s|$)"
-    )
 
     text_msg = MSG_COMMAND_FILTER & filters.TEXT & ~filters.COMMAND
     non_text_msg = MSG_COMMAND_FILTER & ~filters.TEXT & ~filters.COMMAND
@@ -245,18 +294,18 @@ def build_application(
         conversation = ConversationHandler(
             entry_points=[
                 CommandHandler("register", register_start, filters=MSG_COMMAND_FILTER),
+                CommandHandler("editprofile", editprofile_start, filters=MSG_COMMAND_FILTER),
                 CommandHandler("submit", submit_start, filters=MSG_COMMAND_FILTER),
                 CommandHandler("addroute", add_route_entry, filters=MSG_COMMAND_FILTER),
                 MessageHandler(addroute_caption_filter, add_route_caption_entry),
-                CommandHandler("addroutephoto", add_route_photo_cmd, filters=MSG_COMMAND_FILTER),
-                MessageHandler(addroutephoto_caption_filter, add_route_photo_caption_entry),
+                CommandHandler("editroute", edit_route_entry, filters=MSG_COMMAND_FILTER),
                 CallbackQueryHandler(
                     review_prompt_entry_callback,
-                    pattern=r"^review:(reject_reason|zone_custom):[0-9]+$",
+                    pattern=r"^review:reject_reason:[0-9]+$",
                 ),
                 CallbackQueryHandler(
                     gui_conversation_entry_callback,
-                    pattern=r"^gui:(cmd:(register|submit|addroute|broadcast)|(addphoto|setzone_route):[0-9]+)$",
+                    pattern=r"^gui:cmd:(register|editprofile|submit|addroute|editroute|broadcast)$",
                 ),
             ],
             states={
@@ -270,11 +319,16 @@ def build_application(
                     ),
                 ],
                 REGISTER_USERNAME: [
+                    CallbackQueryHandler(
+                        register_skip_username, pattern=r"^reg:skip_username$"
+                    ),
+                    CommandHandler("skip", register_skip_username, filters=MSG_COMMAND_FILTER),
                     MessageHandler(text_msg, register_username),
                     MessageHandler(
                         non_text_msg,
                         _non_text_prompt(
-                            "Please send your username as text, or /cancel.", REGISTER_USERNAME
+                            "Please send your username as text (or tap Skip Username ➡️ / send /skip), or /cancel.",
+                            REGISTER_USERNAME,
                         ),
                     ),
                 ],
@@ -283,7 +337,77 @@ def build_application(
                     MessageHandler(
                         non_text_msg,
                         _non_text_prompt(
-                            "Please send your email address as text, or /cancel.", REGISTER_EMAIL
+                            "Please send your @polytechnique.edu email address as text, or /cancel.",
+                            REGISTER_EMAIL,
+                        ),
+                    ),
+                ],
+                REGISTER_CONFIRM: [
+                    CallbackQueryHandler(
+                        register_confirm_callback, pattern=r"^reg:(confirm|cancel)$"
+                    ),
+                    MessageHandler(text_msg, register_confirm_text),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please tap Confirm & Register ✅ or Cancel ❌ above (or /cancel).",
+                            REGISTER_CONFIRM,
+                        ),
+                    ),
+                ],
+                EDITPROFILE_MENU: [
+                    CallbackQueryHandler(editprofile_menu_callback, pattern=r"^editprof:"),
+                    MessageHandler(
+                        MSG_COMMAND_FILTER & filters.ALL & ~filters.COMMAND,
+                        _non_text_prompt(
+                            "Please tap one of the profile buttons above, or /cancel.",
+                            EDITPROFILE_MENU,
+                        ),
+                    ),
+                ],
+                EDITPROFILE_NAME: [
+                    MessageHandler(text_msg, editprofile_name_text),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please send the new full name as text, or /cancel.",
+                            EDITPROFILE_NAME,
+                        ),
+                    ),
+                ],
+                EDITPROFILE_USERNAME: [
+                    CallbackQueryHandler(
+                        editprofile_menu_callback, pattern=r"^editprof:clear_username$"
+                    ),
+                    MessageHandler(text_msg, editprofile_username_text),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please send the new username as text (or tap Clear Username 🗑️), or /cancel.",
+                            EDITPROFILE_USERNAME,
+                        ),
+                    ),
+                ],
+                EDITPROFILE_EMAIL: [
+                    MessageHandler(text_msg, editprofile_email_text),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please send the new @polytechnique.edu email address as text, or /cancel.",
+                            EDITPROFILE_EMAIL,
+                        ),
+                    ),
+                ],
+                EDITPROFILE_CONFIRM: [
+                    CallbackQueryHandler(
+                        editprofile_confirm_callback,
+                        pattern=r"^editprof:(confirm|back|cancel)$",
+                    ),
+                    MessageHandler(
+                        MSG_COMMAND_FILTER & filters.ALL & ~filters.COMMAND,
+                        _non_text_prompt(
+                            "Please tap Confirm Changes ✅, Back ⬅️, or Cancel ❌ above (or /cancel).",
+                            EDITPROFILE_CONFIRM,
                         ),
                     ),
                 ],
@@ -354,15 +478,83 @@ def build_application(
                         ),
                     ),
                 ],
-                ADDROUTEPHOTO_WAIT: [
-                    CallbackQueryHandler(addroutephoto_callback, pattern=r"^addroutephoto:done$"),
-                    CommandHandler("done", addroutephoto_done, filters=MSG_COMMAND_FILTER),
-                    MessageHandler(image_filter & ~filters.COMMAND, addroutephoto_receive),
+                EDITROUTE_SELECT: [
+                    CallbackQueryHandler(
+                        editroute_select_callback, pattern=r"^editroute:(pick:[0-9]+|cancel)$"
+                    ),
+                    MessageHandler(text_msg, editroute_select_text),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please select a route button above or reply with a route ID, or /cancel.",
+                            EDITROUTE_SELECT,
+                        ),
+                    ),
+                ],
+                EDITROUTE_MENU: [
+                    CallbackQueryHandler(editroute_menu_callback, pattern=r"^editroute:"),
+                    CommandHandler("done", editroute_done_cmd, filters=MSG_COMMAND_FILTER),
+                    MessageHandler(
+                        MSG_COMMAND_FILTER & filters.ALL & ~filters.COMMAND,
+                        _non_text_prompt(
+                            "Please tap one of the edit buttons above (or send /done or /cancel).",
+                            EDITROUTE_MENU,
+                        ),
+                    ),
+                ],
+                EDITROUTE_NAME: [
+                    MessageHandler(text_msg, editroute_name_text),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please send the new route name as text, or /cancel.",
+                            EDITROUTE_NAME,
+                        ),
+                    ),
+                ],
+                EDITROUTE_CATEGORY: [
+                    CallbackQueryHandler(
+                        editroute_category_callback, pattern=r"^editroute:(cat:[0-9]+|back)$"
+                    ),
+                    MessageHandler(text_msg, editroute_category_text),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            f"Please choose a category ({', '.join(ROUTE_CATEGORIES)}), or /cancel.",
+                            EDITROUTE_CATEGORY,
+                        ),
+                    ),
+                ],
+                EDITROUTE_POINTS: [
+                    MessageHandler(text_msg, editroute_points_text),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please enter the points as a positive number, or /cancel.",
+                            EDITROUTE_POINTS,
+                        ),
+                    ),
+                ],
+                EDITROUTE_ZONE: [
+                    CallbackQueryHandler(
+                        editroute_zone_callback, pattern=r"^editroute:(clearzone|back)$"
+                    ),
+                    MessageHandler(text_msg, editroute_zone_text),
+                    MessageHandler(non_text_msg, editroute_zone_non_text),
+                ],
+                EDITROUTE_PHOTOS: [
+                    CallbackQueryHandler(
+                        editroute_photos_callback, pattern=r"^editroute:photos_done$"
+                    ),
+                    CommandHandler(
+                        ["done", "skip"], editroute_photos_done, filters=MSG_COMMAND_FILTER
+                    ),
+                    MessageHandler(image_filter & ~filters.COMMAND, editroute_receive_photo),
                     MessageHandler(
                         MSG_COMMAND_FILTER & filters.ALL & ~filters.COMMAND,
                         _non_text_prompt(
                             "Please send a picture (photo), or send /done when finished, or /cancel.",
-                            ADDROUTEPHOTO_WAIT,
+                            EDITROUTE_PHOTOS,
                         ),
                     ),
                 ],
@@ -373,16 +565,6 @@ def build_application(
                         _non_text_prompt(
                             "Please send the rejection reason as text, or /cancel.",
                             REVIEW_REJECT_REASON,
-                        ),
-                    ),
-                ],
-                REVIEW_CUSTOM_ZONE: [
-                    MessageHandler(text_msg, review_custom_zone_text),
-                    MessageHandler(
-                        non_text_msg,
-                        _non_text_prompt(
-                            "Please enter the partial zone points as a whole number, or /cancel.",
-                            REVIEW_CUSTOM_ZONE,
                         ),
                     ),
                 ],
@@ -414,26 +596,13 @@ def build_application(
             CommandHandler("cancel", cancel_idle, filters=MSG_COMMAND_FILTER),
             CommandHandler("start", start, filters=MSG_COMMAND_FILTER),
             CommandHandler("menu", menu_command, filters=MSG_COMMAND_FILTER),
-            CommandHandler(["mode", "gui"], mode_command, filters=MSG_COMMAND_FILTER),
-            CommandHandler("help", help_command, filters=MSG_COMMAND_FILTER),
-            CommandHandler("admin", admin_status, filters=MSG_COMMAND_FILTER),
+            CommandHandler(["rules", "help"], rules_command, filters=MSG_COMMAND_FILTER),
+            CommandHandler("commands", commands_command, filters=MSG_COMMAND_FILTER),
+            CommandHandler(["role", "admin"], role_status, filters=MSG_COMMAND_FILTER),
             CommandHandler("routes", routes, filters=MSG_COMMAND_FILTER),
             CommandHandler(["route", "routeinfo"], route_info, filters=MSG_COMMAND_FILTER),
             CommandHandler("withdraw", withdraw, filters=MSG_COMMAND_FILTER),
             CommandHandler(["profile", "me"], profile, filters=MSG_COMMAND_FILTER),
-            CommandHandler(
-                ["setroutecategory", "setcategory"],
-                set_route_category_cmd,
-                filters=MSG_COMMAND_FILTER,
-            ),
-            CommandHandler(
-                ["setzonepoints", "setzone"],
-                set_route_zone_points_cmd,
-                filters=MSG_COMMAND_FILTER,
-            ),
-            CommandHandler(
-                ["deactivateroute", "activateroute"], toggle_route, filters=MSG_COMMAND_FILTER
-            ),
             CommandHandler("pending", pending, filters=MSG_COMMAND_FILTER),
             CommandHandler(
                 ["submissions", "allsubmissions"],
@@ -444,9 +613,13 @@ def build_application(
             CommandHandler(["approve", "reject"], review, filters=MSG_COMMAND_FILTER),
             CommandHandler(["zone", "partial"], zone_review_cmd, filters=MSG_COMMAND_FILTER),
             CommandHandler("reopen", reopen_submission_cmd, filters=MSG_COMMAND_FILTER),
-            CommandHandler("regrequests", regrequests_cmd, filters=MSG_COMMAND_FILTER),
             CommandHandler(
-                ["approvereg", "rejectreg"],
+                ["profilerequests", "regrequests"],
+                regrequests_cmd,
+                filters=MSG_COMMAND_FILTER,
+            ),
+            CommandHandler(
+                ["approvereq", "rejectreq", "approvereg", "rejectreg"],
                 review_reg_request_cmd,
                 filters=MSG_COMMAND_FILTER,
             ),
@@ -462,7 +635,10 @@ def build_application(
             ),
             CallbackQueryHandler(route_view_callback, pattern=r"^route:view:[0-9]+$"),
             CallbackQueryHandler(gui_callback, pattern=r"^gui:"),
-            CallbackQueryHandler(stale_addroute_callback, pattern=r"^(addroute|addroutephoto):"),
+            CallbackQueryHandler(
+                stale_addroute_callback,
+                pattern=r"^(addroute|editroute|reg|editprof):",
+            ),
         ]
     )
     application.add_error_handler(_error_handler)

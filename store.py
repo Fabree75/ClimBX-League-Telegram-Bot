@@ -16,13 +16,16 @@ from common import (
 
 LOGGER = logging.getLogger(__name__)
 
+_UNSET = object()
+
 _STUDENT_COLS = (
-    "telegram_id, full_name, COALESCE(username, full_name) AS username, email, registered_at"
+    "telegram_id, full_name, username, COALESCE(username, full_name) AS display_name, "
+    "email, registered_at"
 )
 _REG_REQUEST_SELECT = """
     SELECT rr.id, rr.telegram_id,
            st.full_name AS old_full_name,
-           COALESCE(st.username, st.full_name) AS old_username,
+           st.username AS old_username,
            st.email AS old_email,
            rr.full_name, rr.username, rr.email,
            rr.status, rr.rejection_reason, rr.requested_at,
@@ -74,6 +77,13 @@ def _row_to_route(row: sqlite3.Row) -> Route:
     )
 
 
+def _clean_optional_username(username: Optional[str]) -> Optional[str]:
+    if username is None:
+        return None
+    cleaned = _sanitize_single_line(username.strip().lstrip("@"))
+    return cleaned if cleaned else None
+
+
 class LeagueStore:
     """SQLite repository containing the competition state."""
 
@@ -108,7 +118,7 @@ class LeagueStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id INTEGER NOT NULL REFERENCES students(telegram_id),
                 full_name TEXT NOT NULL,
-                username TEXT NOT NULL,
+                username TEXT,
                 email TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending'
                     CHECK(status IN ('pending', 'approved', 'rejected')),
@@ -123,10 +133,6 @@ class LeagueStore:
                 chat_id INTEGER NOT NULL,
                 message_id INTEGER NOT NULL,
                 UNIQUE(request_id, chat_id, message_id)
-            );
-            CREATE TABLE IF NOT EXISTS user_preferences (
-                telegram_id INTEGER PRIMARY KEY,
-                gui_enabled INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE IF NOT EXISTS routes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -179,8 +185,38 @@ class LeagueStore:
         student_cols = self._table_columns("students")
         if "username" not in student_cols:
             self._connection.execute("ALTER TABLE students ADD COLUMN username TEXT")
-            self._connection.execute(
-                "UPDATE students SET username = full_name WHERE username IS NULL"
+
+        # Migrate registration_requests if an older schema had username NOT NULL
+        reg_req_info = self._connection.execute(
+            "PRAGMA table_info(registration_requests)"
+        ).fetchall()
+        if any(row["name"] == "username" and int(row["notnull"]) == 1 for row in reg_req_info):
+            self._connection.executescript(
+                """
+                PRAGMA foreign_keys = OFF;
+                ALTER TABLE registration_requests RENAME TO _old_registration_requests;
+                CREATE TABLE registration_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER NOT NULL REFERENCES students(telegram_id),
+                    full_name TEXT NOT NULL,
+                    username TEXT,
+                    email TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'approved', 'rejected')),
+                    rejection_reason TEXT,
+                    requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    reviewed_at TEXT,
+                    reviewer_id INTEGER
+                );
+                INSERT INTO registration_requests
+                    (id, telegram_id, full_name, username, email, status,
+                     rejection_reason, requested_at, reviewed_at, reviewer_id)
+                SELECT id, telegram_id, full_name, username, email, status,
+                       rejection_reason, requested_at, reviewed_at, reviewer_id
+                FROM _old_registration_requests;
+                DROP TABLE _old_registration_requests;
+                PRAGMA foreign_keys = ON;
+                """
             )
 
         route_cols = self._table_columns("routes")
@@ -226,24 +262,6 @@ class LeagueStore:
             LOGGER.warning("Existing duplicate active submissions prevented unique index creation")
         self._connection.commit()
 
-    def get_user_gui_mode(self, telegram_id: int) -> bool:
-        row = self._connection.execute(
-            "SELECT gui_enabled FROM user_preferences WHERE telegram_id = ?",
-            (telegram_id,),
-        ).fetchone()
-        return True if row is None else bool(row["gui_enabled"])
-
-    def set_user_gui_mode(self, telegram_id: int, enabled: bool) -> None:
-        self._connection.execute(
-            """
-            INSERT INTO user_preferences (telegram_id, gui_enabled)
-            VALUES (?, ?)
-            ON CONFLICT(telegram_id) DO UPDATE SET gui_enabled = excluded.gui_enabled
-            """,
-            (telegram_id, 1 if enabled else 0),
-        )
-        self._connection.commit()
-
     def register_student(
         self,
         telegram_id: int,
@@ -254,11 +272,7 @@ class LeagueStore:
         cleaned_name = _sanitize_single_line(full_name)
         if not cleaned_name:
             raise ValueError("full_name cannot be empty")
-        cleaned_username = (
-            _sanitize_single_line(username) if username is not None else cleaned_name
-        )
-        if not cleaned_username:
-            raise ValueError("username cannot be empty")
+        cleaned_username = _clean_optional_username(username)
         self._connection.execute(
             """
             INSERT INTO students (telegram_id, full_name, username, email)
@@ -271,6 +285,20 @@ class LeagueStore:
             (telegram_id, cleaned_name, cleaned_username, email.strip().lower()),
         )
         self._connection.commit()
+
+    def update_student_username(
+        self, telegram_id: int, username: Optional[str]
+    ) -> bool:
+        """Directly updates a student's optional username without requiring admin review."""
+        if not self.is_registered(telegram_id):
+            return False
+        cleaned_username = _clean_optional_username(username)
+        cursor = self._connection.execute(
+            "UPDATE students SET username = ? WHERE telegram_id = ?",
+            (cleaned_username, telegram_id),
+        )
+        self._connection.commit()
+        return cursor.rowcount > 0
 
     def get_student(self, telegram_id: int) -> Optional[sqlite3.Row]:
         return self._connection.execute(
@@ -306,14 +334,18 @@ class LeagueStore:
         ).fetchone()
 
     def create_registration_request(
-        self, telegram_id: int, full_name: str, username: str, email: str
+        self,
+        telegram_id: int,
+        full_name: str,
+        username: Optional[str],
+        email: str,
     ) -> int:
         if not self.is_registered(telegram_id):
             raise ValueError("student is not registered yet")
         cleaned_name = _sanitize_single_line(full_name)
-        cleaned_username = _sanitize_single_line(username)
-        if not cleaned_name or not cleaned_username:
-            raise ValueError("name and username cannot be empty")
+        if not cleaned_name:
+            raise ValueError("name cannot be empty")
+        cleaned_username = _clean_optional_username(username)
         if self.get_pending_registration_request(telegram_id) is not None:
             raise ValueError("already_pending")
         cursor = self._connection.execute(
@@ -375,7 +407,7 @@ class LeagueStore:
                 """,
                 (
                     str(req["full_name"]),
-                    str(req["username"]),
+                    req["username"],
                     str(req["email"]),
                     int(req["telegram_id"]),
                 ),
@@ -450,18 +482,69 @@ class LeagueStore:
         self._connection.commit()
         return route_id
 
-    def set_route_zone_points(self, route_id: int, zone_points: Optional[int]) -> bool:
+    def update_route(
+        self,
+        route_id: int,
+        *,
+        name: Optional[str] = None,
+        points: Optional[int] = None,
+        category: Any = _UNSET,
+        zone_points: Any = _UNSET,
+        active: Optional[bool] = None,
+    ) -> Optional[Route]:
+        """Updates any combination of route fields and returns the updated Route."""
         route = self.get_route(route_id)
         if route is None:
-            return False
-        if zone_points is not None and (zone_points <= 0 or zone_points >= route.points):
-            raise ValueError("zone_points must be between 1 and points - 1")
-        cursor = self._connection.execute(
-            "UPDATE routes SET zone_points = ? WHERE id = ?",
-            (zone_points, route_id),
+            return None
+
+        new_name = route.name if name is None else _sanitize_single_line(name)
+        if not new_name:
+            raise ValueError("route name cannot be empty")
+
+        new_points = route.points if points is None else int(points)
+        if new_points <= 0:
+            raise ValueError("points must be positive")
+
+        if category is _UNSET:
+            new_category = route.category
+        elif category is None:
+            new_category = None
+        else:
+            new_category = normalize_route_category(str(category))
+            if new_category is None:
+                raise ValueError("invalid route category")
+
+        if zone_points is _UNSET:
+            new_zone = route.zone_points
+            if new_zone is not None and new_zone >= new_points:
+                new_zone = None
+        else:
+            new_zone = zone_points
+            if new_zone is not None and (new_zone <= 0 or new_zone >= new_points):
+                raise ValueError("zone_points must be between 1 and points - 1")
+
+        new_active = route.active if active is None else bool(active)
+
+        self._connection.execute(
+            """
+            UPDATE routes
+            SET name = ?, points = ?, category = ?, zone_points = ?, active = ?
+            WHERE id = ?
+            """,
+            (
+                new_name,
+                new_points,
+                new_category,
+                new_zone,
+                1 if new_active else 0,
+                route_id,
+            ),
         )
         self._connection.commit()
-        return cursor.rowcount > 0
+        return self.get_route(route_id)
+
+    def set_route_zone_points(self, route_id: int, zone_points: Optional[int]) -> bool:
+        return self.update_route(route_id, zone_points=zone_points) is not None
 
     def add_route_photo(
         self, route_id: int, file_id: str, media_type: str = "photo"
@@ -479,6 +562,15 @@ class LeagueStore:
         self._connection.commit()
         return int(cursor.lastrowid)
 
+    def clear_route_photos(self, route_id: int) -> int:
+        """Removes all pictures attached to route_id and returns the count removed."""
+        cursor = self._connection.execute(
+            "DELETE FROM route_photos WHERE route_id = ?",
+            (route_id,),
+        )
+        self._connection.commit()
+        return int(cursor.rowcount)
+
     def get_route_photos(self, route_id: int) -> list[sqlite3.Row]:
         return list(
             self._connection.execute(
@@ -493,22 +585,10 @@ class LeagueStore:
         )
 
     def set_route_category(self, route_id: int, category: str) -> bool:
-        normalized = normalize_route_category(category)
-        if normalized is None:
-            raise ValueError("invalid route category")
-        cursor = self._connection.execute(
-            "UPDATE routes SET category = ? WHERE id = ?",
-            (normalized, route_id),
-        )
-        self._connection.commit()
-        return cursor.rowcount > 0
+        return self.update_route(route_id, category=category) is not None
 
     def set_route_active(self, route_id: int, active: bool) -> bool:
-        cursor = self._connection.execute(
-            "UPDATE routes SET active = ? WHERE id = ?", (1 if active else 0, route_id)
-        )
-        self._connection.commit()
-        return cursor.rowcount > 0
+        return self.update_route(route_id, active=active) is not None
 
     def list_routes(
         self, active_only: bool = True, category: Optional[str] = None
@@ -737,10 +817,11 @@ class LeagueStore:
         if status == "rejected":
             db_status, db_is_zone, pts = "rejected", 0, None
         elif zone_mode:
-            db_status, db_is_zone = "approved", 1
-            pts = awarded_points if awarded_points is not None else preset_zone
-            if pts is None or pts <= 0 or pts >= route_points:
-                raise ValueError("zone points must be between 1 and route points - 1")
+            if preset_zone is None or preset_zone <= 0 or preset_zone >= route_points:
+                raise ValueError("route has no zone points configured")
+            if awarded_points is not None and awarded_points != preset_zone:
+                raise ValueError("custom zone points are not allowed; use route zone_points")
+            db_status, db_is_zone, pts = "approved", 1, preset_zone
         else:
             conflict = self._connection.execute(
                 """
@@ -754,7 +835,7 @@ class LeagueStore:
             if conflict is not None:
                 return None
             db_status, db_is_zone = "approved", 0
-            pts = awarded_points if awarded_points is not None else route_points
+            pts = route_points
 
         cursor = self._connection.execute(
             """
@@ -848,7 +929,7 @@ class LeagueStore:
                                CASE
                                    WHEN COALESCE(s.is_zone, 0) = 1
                                        THEN COALESCE(s.awarded_points, r.zone_points, 0)
-                                   ELSE COALESCE(s.awarded_points, r.points)
+                                   ELSE r.points
                                END
                            ) AS earned_points,
                            MAX(CASE WHEN COALESCE(s.is_zone, 0) = 0 THEN 1 ELSE 0 END) AS is_top,
@@ -932,10 +1013,12 @@ class LeagueStore:
             (telegram_id,),
         ).fetchall()
 
+        raw_username = student["username"]
         return {
             "telegram_id": int(student["telegram_id"]),
             "full_name": str(student["full_name"]),
-            "username": str(student["username"]),
+            "username": str(raw_username) if raw_username is not None else None,
+            "display_name": str(student["display_name"]),
             "email": str(student["email"]),
             "registered_at": str(student["registered_at"]),
             "rank": rank,

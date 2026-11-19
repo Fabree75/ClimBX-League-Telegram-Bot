@@ -1,4 +1,4 @@
-"""Proof submission, withdrawal, admin listing, review, and reopening handlers."""
+"""Proof submission, withdrawal, admin listing, preset-zone review, and reopening handlers."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes, ConversationHandler
 
 from common import (
-    REVIEW_CUSTOM_ZONE,
     REVIEW_REJECT_REASON,
     SUBMIT_PROOF,
     SUBMIT_ROUTE,
@@ -18,6 +17,7 @@ from common import (
     _clear_conversation_data,
     _extract_video_info,
     _is_admin,
+    _menu_button_markup,
     _parse_positive_int,
     _reply_chunked,
     _sanitize_single_line,
@@ -46,18 +46,23 @@ async def _validate_and_prepare_route_submission(
     store = _store(context)
     route = store.get_route(route_id)
     if route is None or not route.active:
-        await update.effective_message.reply_text("That route is not active. Check /routes.")
+        await update.effective_message.reply_text(
+            "That route is not active. Check /routes.",
+            reply_markup=_menu_button_markup(),
+        )
         return ConversationHandler.END
 
     status = store.get_student_route_status(update.effective_user.id, route_id)
     if status == "approved":
         await update.effective_message.reply_text(
-            f"You have already completed '{route.name}' and received points for it! 🎉"
+            f"You have already completed '{route.name}' and received points for it! 🎉",
+            reply_markup=_menu_button_markup(),
         )
         return ConversationHandler.END
     if status == "pending":
         await update.effective_message.reply_text(
-            f"You already have a pending submission for '{route.name}'. Please wait for an admin to review it."
+            f"You already have a pending submission for '{route.name}'. Please wait for an admin to review it.",
+            reply_markup=_menu_button_markup(),
         )
         return ConversationHandler.END
 
@@ -71,18 +76,25 @@ async def prompt_open_routes_for_submit(
 ) -> int:
     """List open routes for a registered student and enter SUBMIT_ROUTE state."""
     if not store.is_registered(user_id):
-        await message.reply_text("Please register first with /register.")
+        await message.reply_text(
+            "Please register first with /register.",
+            reply_markup=_menu_button_markup(),
+        )
         return ConversationHandler.END
 
     active_routes = store.list_routes(active_only=True)
     if not active_routes:
-        await message.reply_text("No active routes are available right now.")
+        await message.reply_text(
+            "No active routes are available right now.",
+            reply_markup=_menu_button_markup(),
+        )
         return ConversationHandler.END
     statuses = store.get_student_route_statuses(user_id)
     open_routes = [r for r in active_routes if statuses.get(r.id) not in {"approved", "pending"}]
     if not open_routes:
         await message.reply_text(
-            "You have already completed or submitted all active routes! 🎉"
+            "You have already completed or submitted all active routes! 🎉",
+            reply_markup=_menu_button_markup(),
         )
         return ConversationHandler.END
     route_lines = "\n".join(
@@ -107,7 +119,10 @@ async def submit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     store = _store(context)
     user_id = update.effective_user.id
     if not store.is_registered(user_id):
-        await update.effective_message.reply_text("Please register first with /register.")
+        await update.effective_message.reply_text(
+            "Please register first with /register.",
+            reply_markup=_menu_button_markup(),
+        )
         return ConversationHandler.END
 
     parts = (update.effective_message.text or "").split(maxsplit=1)
@@ -116,7 +131,10 @@ async def submit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     route_id = _parse_positive_int(parts[1], strip_hash=True)
     if route_id is None:
-        await update.effective_message.reply_text("Usage: /submit <route_id>")
+        await update.effective_message.reply_text(
+            "Usage: /submit <route_id>",
+            reply_markup=_menu_button_markup(),
+        )
         return ConversationHandler.END
 
     return await _validate_and_prepare_route_submission(update, context, route_id)
@@ -164,16 +182,23 @@ def _format_submission_caption(
     return caption
 
 
-def _submission_review_keyboard(submission_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Approve ✅", callback_data=f"review:approve:{submission_id}"),
-                InlineKeyboardButton("Zone 🔶", callback_data=f"review:zone:{submission_id}"),
-                InlineKeyboardButton("Reject ❌", callback_data=f"review:reject:{submission_id}"),
-            ]
-        ]
+def _submission_review_keyboard(
+    submission_id: int, zone_points: Optional[int] = None
+) -> InlineKeyboardMarkup:
+    row = [
+        InlineKeyboardButton("Approve ✅", callback_data=f"review:approve:{submission_id}")
+    ]
+    if zone_points is not None:
+        row.append(
+            InlineKeyboardButton(
+                f"Zone ({zone_points} pts) 🔶",
+                callback_data=f"review:zone:{submission_id}",
+            )
+        )
+    row.append(
+        InlineKeyboardButton("Reject ❌", callback_data=f"review:reject:{submission_id}")
     )
+    return InlineKeyboardMarkup([row])
 
 
 async def _send_submission_to_admin(
@@ -192,6 +217,7 @@ async def _send_submission_to_admin(
     *,
     is_zone: bool = False,
     awarded_points: Optional[int] = None,
+    zone_points: Optional[int] = None,
 ) -> Optional[tuple[int, bool]]:
     caption = _format_submission_caption(
         submission_id=submission_id,
@@ -206,7 +232,11 @@ async def _send_submission_to_admin(
         awarded_points=awarded_points,
     )
 
-    keyboard = _submission_review_keyboard(submission_id) if status == "pending" else None
+    keyboard = (
+        _submission_review_keyboard(submission_id, zone_points)
+        if status == "pending"
+        else None
+    )
 
     is_caption = True
     if media_type == "video_note":
@@ -259,7 +289,10 @@ async def receive_proof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     store = _store(context)
     raw_route_id = context.user_data.pop("route_id", None)
     if raw_route_id is None:
-        await message.reply_text("Submission session expired. Please run /submit again.")
+        await message.reply_text(
+            "Submission session expired. Please run /submit again.",
+            reply_markup=_menu_button_markup(),
+        )
         return ConversationHandler.END
     route_id = int(raw_route_id)
     route = store.get_route(route_id)
@@ -270,15 +303,17 @@ async def receive_proof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
     except ValueError as e:
         if str(e) == "already_approved":
-            await message.reply_text("You have already completed this route.")
+            err_msg = "You have already completed this route."
         elif str(e) == "already_pending":
-            await message.reply_text("You already have a pending submission for this route.")
+            err_msg = "You already have a pending submission for this route."
         else:
-            await message.reply_text("Unable to submit: route is no longer active.")
+            err_msg = "Unable to submit: route is no longer active."
+        await message.reply_text(err_msg, reply_markup=_menu_button_markup())
         return ConversationHandler.END
 
     await message.reply_text(
-        f"Proof submitted (#{submission_id}). An admin will review your video."
+        f"Proof submitted (#{submission_id}). An admin will review your video.",
+        reply_markup=_menu_button_markup(),
     )
 
     student_row = store.get_student(update.effective_user.id)
@@ -301,6 +336,7 @@ async def receive_proof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 video_file_id=video_file_id,
                 media_type=media_type,
                 status="pending",
+                zone_points=route.zone_points,
             )
             if sent_info is not None:
                 msg_id, is_caption = sent_info
@@ -338,18 +374,29 @@ async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     store = _store(context)
     user_id = update.effective_user.id
     if not store.is_registered(user_id):
-        await update.effective_message.reply_text("Please register first with /register.")
+        await update.effective_message.reply_text(
+            "Please register first with /register.",
+            reply_markup=_menu_button_markup(),
+        )
         return
     if not context.args or len(context.args) != 1:
-        await update.effective_message.reply_text("Usage: /withdraw <route_id>")
+        await update.effective_message.reply_text(
+            "Usage: /withdraw <route_id>",
+            reply_markup=_menu_button_markup(),
+        )
         return
     route_id = _parse_positive_int(context.args[0], strip_hash=True)
     if route_id is None:
-        await update.effective_message.reply_text("Usage: /withdraw <route_id>")
+        await update.effective_message.reply_text(
+            "Usage: /withdraw <route_id>",
+            reply_markup=_menu_button_markup(),
+        )
         return
 
     _, reply_msg = await perform_withdraw(context.bot, store, user_id, route_id)
-    await update.effective_message.reply_text(reply_msg)
+    await update.effective_message.reply_text(
+        reply_msg, reply_markup=_menu_button_markup()
+    )
 
 
 async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -357,18 +404,26 @@ async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message:
         return
     if not _is_admin(update):
-        await update.effective_message.reply_text("Admin access required.")
+        await update.effective_message.reply_text(
+            "Admin access required.", reply_markup=_menu_button_markup()
+        )
         return
     rows = _store(context).pending_submissions()
     if not rows:
-        await update.effective_message.reply_text("No pending submissions.")
+        await update.effective_message.reply_text(
+            "No pending submissions.", reply_markup=_menu_button_markup()
+        )
         return
     lines = [
         f"#{row['id']} {row['full_name']} - {row['name']} ({row['points']} pts)"
         for row in rows
     ]
     lines.append("\nTip: Use /submission <id> to watch video proof.")
-    await _reply_chunked(update.effective_message, "\n".join(lines))
+    await _reply_chunked(
+        update.effective_message,
+        "\n".join(lines),
+        reply_markup=_menu_button_markup(),
+    )
 
 
 async def all_submissions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -376,19 +431,24 @@ async def all_submissions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not update.effective_message:
         return
     if not _is_admin(update):
-        await update.effective_message.reply_text("Admin access required.")
+        await update.effective_message.reply_text(
+            "Admin access required.", reply_markup=_menu_button_markup()
+        )
         return
     status_filter = "all"
     if context.args:
         status_filter = context.args[0].strip().lower()
         if status_filter not in {"all", "pending", "approved", "top", "zone", "rejected"}:
             await update.effective_message.reply_text(
-                "Usage: /submissions [all|pending|approved|zone|rejected]"
+                "Usage: /submissions [all|pending|approved|zone|rejected]",
+                reply_markup=_menu_button_markup(),
             )
             return
     rows = _store(context).all_submissions(status_filter=status_filter)
     if not rows:
-        await update.effective_message.reply_text("No submissions found.")
+        await update.effective_message.reply_text(
+            "No submissions found.", reply_markup=_menu_button_markup()
+        )
         return
 
     lines: list[str] = []
@@ -410,7 +470,11 @@ async def all_submissions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"#{row['route_id']} {row['route_name']} [{badge}]"
         )
     lines.append("\nTip: Use /submission <id> to view video & review card.")
-    await _reply_chunked(update.effective_message, "\n".join(lines))
+    await _reply_chunked(
+        update.effective_message,
+        "\n".join(lines),
+        reply_markup=_menu_button_markup(),
+    )
 
 
 async def view_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -418,18 +482,29 @@ async def view_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not update.effective_message or not update.effective_chat:
         return
     if not _is_admin(update):
-        await update.effective_message.reply_text("Admin access required.")
+        await update.effective_message.reply_text(
+            "Admin access required.", reply_markup=_menu_button_markup()
+        )
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /submission <submission_id>")
+        await update.effective_message.reply_text(
+            "Usage: /submission <submission_id>",
+            reply_markup=_menu_button_markup(),
+        )
         return
     submission_id = _parse_positive_int(context.args[0], strip_hash=True)
     if submission_id is None:
-        await update.effective_message.reply_text("Usage: /submission <submission_id>")
+        await update.effective_message.reply_text(
+            "Usage: /submission <submission_id>",
+            reply_markup=_menu_button_markup(),
+        )
         return
     sub = _store(context).get_submission(submission_id)
     if not sub:
-        await update.effective_message.reply_text(f"Submission #{submission_id} not found.")
+        await update.effective_message.reply_text(
+            f"Submission #{submission_id} not found.",
+            reply_markup=_menu_button_markup(),
+        )
         return
 
     try:
@@ -448,12 +523,14 @@ async def view_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             rejection_reason=sub["rejection_reason"],
             is_zone=bool(sub["is_zone"]),
             awarded_points=int(sub["awarded_points"]) if sub["awarded_points"] is not None else None,
+            zone_points=int(sub["zone_points"]) if sub["zone_points"] is not None else None,
         )
     except Exception:
         LOGGER.warning("Failed to send submission %s video to admin", submission_id)
         await update.effective_message.reply_text(
             f"Submission #{submission_id} by {sub['full_name']} for '{sub['route_name']}' "
-            f"(Status: {sub['status']}) — could not load video preview."
+            f"(Status: {sub['status']}) — could not load video preview.",
+            reply_markup=_menu_button_markup(),
         )
 
 
@@ -641,7 +718,9 @@ async def _finalize_submission_review(
         is_zone=is_zone,
     )
     try:
-        await bot.send_message(chat_id=student_id, text=msg)
+        await bot.send_message(
+            chat_id=student_id, text=msg, reply_markup=_menu_button_markup()
+        )
     except Exception:
         LOGGER.warning("Failed to notify student %s about submission review", student_id)
 
@@ -651,20 +730,18 @@ async def review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.effective_message:
         return
     if not _is_admin(update):
-        await update.effective_message.reply_text("Admin access required.")
+        await update.effective_message.reply_text(
+            "Admin access required.", reply_markup=_menu_button_markup()
+        )
         return
     is_approve = (update.effective_message.text or "").split()[0].startswith("/approve")
     submission_id = (
         _parse_positive_int(context.args[0], strip_hash=True) if context.args else None
     )
-    if submission_id is None:
+    if submission_id is None or (is_approve and len(context.args) != 1):
         await update.effective_message.reply_text(
-            "Usage: /approve <id> or /reject <id> [reason]"
-        )
-        return
-    if is_approve and len(context.args) != 1:
-        await update.effective_message.reply_text(
-            "Usage: /approve <id> or /reject <id> [reason]"
+            "Usage: /approve <id> or /reject <id> [reason]",
+            reply_markup=_menu_button_markup(),
         )
         return
 
@@ -683,10 +760,16 @@ async def review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         rejection_reason=rejection_reason,
     )
     if not submission:
-        await update.effective_message.reply_text("Submission not found or already reviewed.")
+        await update.effective_message.reply_text(
+            "Submission not found or already reviewed.",
+            reply_markup=_menu_button_markup(),
+        )
         return
 
-    await update.effective_message.reply_text(f"Submission #{submission_id} {status}.")
+    await update.effective_message.reply_text(
+        f"Submission #{submission_id} {status}.",
+        reply_markup=_menu_button_markup(),
+    )
 
     admin_display = update.effective_user.first_name or "Admin"
     decision_text = "APPROVED ✅" if is_approve else "REJECTED ❌"
@@ -703,39 +786,42 @@ async def review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def zone_review_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Award partial zone points to a pending submission via /zone <id> [points]."""
+    """Award the route's established partial zone points via /zone <submission_id>."""
     if not update.effective_user or not update.effective_message:
         return
     if not _is_admin(update):
-        await update.effective_message.reply_text("Admin access required.")
+        await update.effective_message.reply_text(
+            "Admin access required.", reply_markup=_menu_button_markup()
+        )
         return
-    if not context.args or len(context.args) > 2:
-        await update.effective_message.reply_text("Usage: /zone <submission_id> [zone_points]")
+    if not context.args or len(context.args) != 1:
+        await update.effective_message.reply_text(
+            "Usage: /zone <submission_id>",
+            reply_markup=_menu_button_markup(),
+        )
         return
     submission_id = _parse_positive_int(context.args[0], strip_hash=True)
     if submission_id is None:
-        await update.effective_message.reply_text("Usage: /zone <submission_id> [zone_points]")
+        await update.effective_message.reply_text(
+            "Usage: /zone <submission_id>",
+            reply_markup=_menu_button_markup(),
+        )
         return
 
     store = _store(context)
     sub = store.get_submission(submission_id)
     if sub is None or str(sub["status"]) != "pending":
-        await update.effective_message.reply_text("Submission not found or already reviewed.")
+        await update.effective_message.reply_text(
+            "Submission not found or already reviewed.",
+            reply_markup=_menu_button_markup(),
+        )
         return
 
-    route_points = int(sub["points"])
-    custom_pts: Optional[int] = None
-    if len(context.args) == 2:
-        custom_pts = _parse_positive_int(context.args[1])
-        if custom_pts is None or custom_pts >= route_points:
-            await update.effective_message.reply_text(
-                f"Zone points must be between 1 and {route_points - 1}."
-            )
-            return
-    elif sub["zone_points"] is None:
+    if sub["zone_points"] is None:
         await update.effective_message.reply_text(
-            f"Route '{sub['route_name']}' has no preset zone points. "
-            f"Specify points: /zone {submission_id} <points> (1 to {route_points - 1})."
+            f"Route '{sub['route_name']}' does not have zone points configured. "
+            "Zones can only be added or modified via /addroute or /editroute.",
+            reply_markup=_menu_button_markup(),
         )
         return
 
@@ -744,15 +830,18 @@ async def zone_review_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "zone",
         reviewer_id=update.effective_user.id,
         is_zone=True,
-        awarded_points=custom_pts,
     )
     if not reviewed:
-        await update.effective_message.reply_text("Submission not found or already reviewed.")
+        await update.effective_message.reply_text(
+            "Submission not found or already reviewed.",
+            reply_markup=_menu_button_markup(),
+        )
         return
 
     awarded = int(reviewed["awarded_points"])
     await update.effective_message.reply_text(
-        f"Submission #{submission_id} awarded Zone ({awarded} pts)."
+        f"Submission #{submission_id} awarded Zone ({awarded} pts).",
+        reply_markup=_menu_button_markup(),
     )
     admin_display = update.effective_user.first_name or "Admin"
     await _finalize_submission_review(
@@ -767,7 +856,7 @@ async def zone_review_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle one-click approve, reject, and zone inline buttons on submission cards."""
+    """Handle one-click approve, preset zone, and reject inline buttons on submission cards."""
     query = update.callback_query
     if not query:
         return
@@ -801,11 +890,13 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("This submission was already reviewed.", show_alert=True)
         return
 
+    route_zone_pts = int(sub["zone_points"]) if sub["zone_points"] is not None else None
+
     if action == "back":
         await query.answer()
         try:
             await query.edit_message_reply_markup(
-                reply_markup=_submission_review_keyboard(submission_id)
+                reply_markup=_submission_review_keyboard(submission_id, route_zone_pts)
             )
         except Exception:
             pass
@@ -833,47 +924,19 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             pass
         return
 
-    if action == "zone":
-        await query.answer("Select Zone / partial points option.")
-        rows_kb: list[list[InlineKeyboardButton]] = []
-        if sub["zone_points"] is not None:
-            z_pts = int(sub["zone_points"])
-            rows_kb.append(
-                [
-                    InlineKeyboardButton(
-                        f"Award Zone ({z_pts} pts) 🔶",
-                        callback_data=f"review:zone_preset:{submission_id}",
-                    )
-                ]
-            )
-        rows_kb.append(
-            [
-                InlineKeyboardButton(
-                    "Custom Partial Points 🔢",
-                    callback_data=f"review:zone_custom:{submission_id}",
-                )
-            ]
-        )
-        rows_kb.append(
-            [InlineKeyboardButton("⬅️ Back", callback_data=f"review:back:{submission_id}")]
-        )
-        try:
-            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows_kb))
-        except Exception:
-            pass
-        return
-
     admin_display = update.effective_user.first_name or "Admin"
-    if action == "zone_preset":
-        if sub["zone_points"] is None:
-            await query.answer("No preset zone points on this route.", show_alert=True)
+    if action in {"zone", "zone_preset"}:
+        if route_zone_pts is None:
+            await query.answer(
+                "This route does not have zone points configured.",
+                show_alert=True,
+            )
             return
         submission = store.review_submission(
             submission_id,
             "zone",
             reviewer_id=update.effective_user.id,
             is_zone=True,
-            awarded_points=int(sub["zone_points"]),
         )
         if not submission:
             try:
@@ -924,7 +987,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def review_prompt_entry_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    """Enter conversation state to collect a rejection reason or custom zone points."""
+    """Enter conversation state to collect a rejection reason for a submission."""
     query = update.callback_query
     if not query:
         return ConversationHandler.END
@@ -933,11 +996,10 @@ async def review_prompt_entry_callback(
         return ConversationHandler.END
 
     parts = (query.data or "").split(":")
-    if len(parts) != 3 or parts[0] != "review":
+    if len(parts) != 3 or parts[0] != "review" or parts[1] != "reject_reason":
         await query.answer("Invalid review action.", show_alert=True)
         return ConversationHandler.END
-    action, sub_id_str = parts[1], parts[2]
-    submission_id = _parse_positive_int(sub_id_str)
+    submission_id = _parse_positive_int(parts[2])
     if submission_id is None:
         await query.answer("Invalid submission ID.", show_alert=True)
         return ConversationHandler.END
@@ -965,23 +1027,11 @@ async def review_prompt_entry_callback(
         ) or ""
 
     await query.answer()
-    if action == "reject_reason":
-        if query.message:
-            await query.message.reply_text(
-                f"✏️ Send the rejection reason for Submission #{submission_id} (or /cancel):"
-            )
-        return REVIEW_REJECT_REASON
-
-    if action == "zone_custom":
-        max_zone = max(1, int(sub["points"]) - 1)
-        if query.message:
-            await query.message.reply_text(
-                f"🔢 Enter the partial (Zone) points to award for Submission #{submission_id} "
-                f"(1 to {max_zone}, or /cancel):"
-            )
-        return REVIEW_CUSTOM_ZONE
-
-    return ConversationHandler.END
+    if query.message:
+        await query.message.reply_text(
+            f"✏️ Send the rejection reason for Submission #{submission_id} (or /cancel):"
+        )
+    return REVIEW_REJECT_REASON
 
 
 async def review_reject_reason_text(
@@ -1007,7 +1057,9 @@ async def review_reject_reason_text(
     _clear_conversation_data(context)
 
     if sub_id is None:
-        await update.effective_message.reply_text("Review session expired.")
+        await update.effective_message.reply_text(
+            "Review session expired.", reply_markup=_menu_button_markup()
+        )
         return ConversationHandler.END
 
     store = _store(context)
@@ -1018,11 +1070,15 @@ async def review_reject_reason_text(
         rejection_reason=reason,
     )
     if not submission:
-        await update.effective_message.reply_text("Submission not found or already reviewed.")
+        await update.effective_message.reply_text(
+            "Submission not found or already reviewed.",
+            reply_markup=_menu_button_markup(),
+        )
         return ConversationHandler.END
 
     await update.effective_message.reply_text(
-        f"Submission #{sub_id} rejected (Reason: {reason})."
+        f"Submission #{sub_id} rejected (Reason: {reason}).",
+        reply_markup=_menu_button_markup(),
     )
     admin_display = update.effective_user.first_name or "Admin"
     await _finalize_submission_review(
@@ -1037,100 +1093,48 @@ async def review_reject_reason_text(
     return ConversationHandler.END
 
 
-async def review_custom_zone_text(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    """Award custom partial zone points and sync all review cards."""
-    if not update.effective_user or not update.effective_message:
-        return ConversationHandler.END
-    sub_id = context.user_data.get("review_submission_id")
-    if sub_id is None:
-        _clear_conversation_data(context)
-        await update.effective_message.reply_text("Review session expired.")
-        return ConversationHandler.END
-
-    store = _store(context)
-    sub = store.get_submission(int(sub_id))
-    if not sub or str(sub["status"]) != "pending":
-        _clear_conversation_data(context)
-        await update.effective_message.reply_text("Submission not found or already reviewed.")
-        return ConversationHandler.END
-
-    route_points = int(sub["points"])
-    pts = _parse_positive_int(update.effective_message.text or "")
-    if pts is None or pts >= route_points:
-        await update.effective_message.reply_text(
-            f"Please enter a whole number between 1 and {route_points - 1}, or /cancel."
-        )
-        return REVIEW_CUSTOM_ZONE
-
-    card_info = (
-        context.user_data.get("review_card_chat_id"),
-        context.user_data.get("review_card_message_id"),
-        bool(context.user_data.get("review_card_is_caption", True)),
-        str(context.user_data.get("review_card_base_text") or ""),
-    )
-    _clear_conversation_data(context)
-
-    submission = store.review_submission(
-        int(sub_id),
-        "zone",
-        reviewer_id=update.effective_user.id,
-        is_zone=True,
-        awarded_points=pts,
-    )
-    if not submission:
-        await update.effective_message.reply_text("Submission not found or already reviewed.")
-        return ConversationHandler.END
-
-    await update.effective_message.reply_text(
-        f"Submission #{sub_id} awarded Zone ({pts} pts)."
-    )
-    admin_display = update.effective_user.first_name or "Admin"
-    await _finalize_submission_review(
-        context.bot,
-        store,
-        submission,
-        status="zone",
-        decision_label=f"ZONE 🔶 (+{pts} pts) by {admin_display}",
-        is_zone=True,
-        awarded_points=pts,
-        card_info=card_info,
-    )
-    return ConversationHandler.END
-
-
 async def reopen_submission_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Reopen a closed submission back to pending status via /reopen <id>."""
     if not update.effective_message:
         return
     if not _is_admin(update):
-        await update.effective_message.reply_text("Admin access required.")
+        await update.effective_message.reply_text(
+            "Admin access required.", reply_markup=_menu_button_markup()
+        )
         return
     submission_id = (
         _parse_positive_int(context.args[0], strip_hash=True) if context.args else None
     )
     if submission_id is None:
-        await update.effective_message.reply_text("Usage: /reopen <submission_id>")
+        await update.effective_message.reply_text(
+            "Usage: /reopen <submission_id>",
+            reply_markup=_menu_button_markup(),
+        )
         return
 
     sub, error = _store(context).reopen_submission(submission_id)
     if error == "not_found":
-        await update.effective_message.reply_text(f"Submission #{submission_id} not found.")
+        await update.effective_message.reply_text(
+            f"Submission #{submission_id} not found.",
+            reply_markup=_menu_button_markup(),
+        )
         return
     if error == "already_pending":
         await update.effective_message.reply_text(
-            f"Submission #{submission_id} is already pending review."
+            f"Submission #{submission_id} is already pending review.",
+            reply_markup=_menu_button_markup(),
         )
         return
     if error == "conflict_active_submission":
         await update.effective_message.reply_text(
-            f"Cannot reopen submission #{submission_id}: student already has another pending or approved submission for that route."
+            f"Cannot reopen submission #{submission_id}: student already has another pending or approved submission for that route.",
+            reply_markup=_menu_button_markup(),
         )
         return
 
     await update.effective_message.reply_text(
-        f"Submission #{submission_id} reopened to pending. Use /submission {submission_id} to review it."
+        f"Submission #{submission_id} reopened to pending. Use /submission {submission_id} to review it.",
+        reply_markup=_menu_button_markup(),
     )
     try:
         await context.bot.send_message(
@@ -1139,6 +1143,7 @@ async def reopen_submission_cmd(update: Update, context: ContextTypes.DEFAULT_TY
                 f"🔄 Your submission #{submission_id} for '{sub['route_name']}' "
                 "has been reopened for re-evaluation by an admin."
             ),
+            reply_markup=_menu_button_markup(),
         )
     except Exception:
         LOGGER.warning("Failed to notify student %s about reopened submission", sub["telegram_id"])

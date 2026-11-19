@@ -1,4 +1,4 @@
-"""Shared constants, state identifiers, input parsers, and Telegram helpers."""
+"""Shared constants, state identifiers, input parsers, role checks, and Telegram helpers."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import re
 import sqlite3
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Sequence
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes, filters
 
 if TYPE_CHECKING:
@@ -17,6 +17,12 @@ if TYPE_CHECKING:
     REGISTER_NAME,
     REGISTER_USERNAME,
     REGISTER_EMAIL,
+    REGISTER_CONFIRM,
+    EDITPROFILE_MENU,
+    EDITPROFILE_NAME,
+    EDITPROFILE_USERNAME,
+    EDITPROFILE_EMAIL,
+    EDITPROFILE_CONFIRM,
     SUBMIT_ROUTE,
     SUBMIT_PROOF,
     ADDROUTE_CATEGORY,
@@ -24,11 +30,16 @@ if TYPE_CHECKING:
     ADDROUTE_POINTS,
     ADDROUTE_ZONE,
     ADDROUTE_PHOTOS,
-    ADDROUTEPHOTO_WAIT,
-    REVIEW_CUSTOM_ZONE,
+    EDITROUTE_SELECT,
+    EDITROUTE_MENU,
+    EDITROUTE_NAME,
+    EDITROUTE_CATEGORY,
+    EDITROUTE_POINTS,
+    EDITROUTE_ZONE,
+    EDITROUTE_PHOTOS,
     REVIEW_REJECT_REASON,
     GUI_PROMPT_INPUT,
-) = range(14)
+) = range(25)
 
 ROUTE_CATEGORIES: tuple[str, ...] = ("Arkose", "ENSTA gym", "Pan", "Outdoors")
 _CATEGORY_ALIASES: dict[str, str] = {
@@ -48,28 +59,33 @@ MAX_TELEGRAM_MESSAGE_LENGTH = 4096
 SAFE_MESSAGE_CHUNK_LENGTH = 4000
 SQLITE_MAX_INT = 9_223_372_036_854_775_807
 
-_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$")
+_EMAIL_RE = re.compile(
+    r"^[A-Za-z0-9_%+-]+(?:\.[A-Za-z0-9_%+-]+)*@polytechnique\.edu$",
+    re.IGNORECASE,
+)
 MSG_COMMAND_FILTER = filters.UpdateType.MESSAGE
 
 _CONVERSATION_DATA_KEYS = (
     "route_id",
     "full_name",
     "username",
-    "is_reregister",
+    "email",
+    "editprof_full_name",
+    "editprof_username",
+    "editprof_email",
     "addroute_category",
     "addroute_name",
     "addroute_points",
     "addroute_zone_points",
     "addroute_photos",
-    "addroutephoto_id",
-    "addroutephoto_count",
+    "editroute_id",
+    "editroute_photo_count",
     "review_submission_id",
     "review_card_chat_id",
     "review_card_message_id",
     "review_card_is_caption",
     "review_card_base_text",
     "gui_action",
-    "gui_route_id",
 )
 
 
@@ -87,6 +103,7 @@ def _parse_positive_int(raw: str, *, strip_hash: bool = False) -> Optional[int]:
 
 
 def _is_valid_email(email: str) -> bool:
+    """Validates that the email is a well-formed @polytechnique.edu address."""
     return bool(_EMAIL_RE.fullmatch(email.strip()))
 
 
@@ -111,6 +128,24 @@ def _compute_competition_ranks(rows: Sequence[sqlite3.Row]) -> list[tuple[int, s
             prev_score = score
         ranked.append((current_rank, row))
     return ranked
+
+
+def _menu_button_markup() -> InlineKeyboardMarkup:
+    """Returns a single-button inline keyboard that opens the role-based GUI menu."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📋 Open Menu", callback_data="gui:menu")]]
+    )
+
+
+def _with_menu_button(
+    markup: Optional[InlineKeyboardMarkup] = None,
+) -> InlineKeyboardMarkup:
+    """Appends the '📋 Open Menu' button row to an existing inline keyboard (or creates one)."""
+    if markup is None:
+        return _menu_button_markup()
+    rows = [list(row) for row in markup.inline_keyboard]
+    rows.append([InlineKeyboardButton("📋 Open Menu", callback_data="gui:menu")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def _reply_chunked(message: Any, text: str, **kwargs: Any) -> None:
@@ -145,25 +180,44 @@ async def _reply_chunked(message: Any, text: str, **kwargs: Any) -> None:
     if current_lines:
         chunks.append("\n".join(current_lines))
 
-    for chunk in chunks:
-        await message.reply_text(chunk, **kwargs)
+    non_final_kwargs = {k: v for k, v in kwargs.items() if k != "reply_markup"}
+    for idx, chunk in enumerate(chunks):
+        chunk_kwargs = kwargs if idx == len(chunks) - 1 else non_final_kwargs
+        await message.reply_text(chunk, **chunk_kwargs)
 
 
 def _store(context: ContextTypes.DEFAULT_TYPE) -> LeagueStore:
     return context.application.bot_data["store"]
 
 
-def _admin_ids() -> set[int]:
+def _parse_id_env(var_name: str) -> set[int]:
     ids: set[int] = set()
-    for value in os.getenv("ADMIN_IDS", "").split(","):
+    for value in os.getenv(var_name, "").split(","):
         parsed = _parse_positive_int(value)
         if parsed is not None:
             ids.add(parsed)
     return ids
 
 
+def _admin_ids() -> set[int]:
+    return _parse_id_env("ADMIN_IDS")
+
+
+def _routesetter_ids() -> set[int]:
+    return _parse_id_env("ROUTESETTER_IDS")
+
+
 def _is_admin(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id in _admin_ids())
+
+
+def _is_routesetter(update: Update) -> bool:
+    return bool(update.effective_user and update.effective_user.id in _routesetter_ids())
+
+
+def _can_manage_routes(update: Update) -> bool:
+    """Returns True if the user is either a routesetter or an admin."""
+    return _is_admin(update) or _is_routesetter(update)
 
 
 def _clear_conversation_data(context: ContextTypes.DEFAULT_TYPE) -> None:
