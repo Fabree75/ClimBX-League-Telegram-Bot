@@ -39,7 +39,22 @@ if TYPE_CHECKING:
     EDITROUTE_PHOTOS,
     REVIEW_REJECT_REASON,
     GUI_PROMPT_INPUT,
-) = range(25)
+    SUBMIT_CHALLENGE,
+    SUBMIT_CHALLENGE_PROOF,
+    ADDCHALLENGE_NAME,
+    ADDCHALLENGE_DESCRIPTION,
+    ADDCHALLENGE_POINTS,
+    ADDCHALLENGE_PHOTOS,
+    EDITCHALLENGE_SELECT,
+    EDITCHALLENGE_MENU,
+    EDITCHALLENGE_NAME,
+    EDITCHALLENGE_DESCRIPTION,
+    EDITCHALLENGE_POINTS,
+    EDITCHALLENGE_PHOTOS,
+    EDITCHALLENGE_DELETE_CONFIRM,
+    CHALLENGE_REVIEW_REJECT_REASON,
+    ADDROUTESETTER_INPUT,
+) = range(40)
 
 ROUTE_CATEGORIES: tuple[str, ...] = ("Arkose", "ENSTA gym", "Pan", "Outdoors")
 _CATEGORY_ALIASES: dict[str, str] = {
@@ -67,6 +82,7 @@ MSG_COMMAND_FILTER = filters.UpdateType.MESSAGE
 
 _CONVERSATION_DATA_KEYS = (
     "route_id",
+    "challenge_id",
     "full_name",
     "username",
     "email",
@@ -80,11 +96,22 @@ _CONVERSATION_DATA_KEYS = (
     "addroute_photos",
     "editroute_id",
     "editroute_photo_count",
+    "addchallenge_name",
+    "addchallenge_description",
+    "addchallenge_points",
+    "addchallenge_photos",
+    "editchallenge_id",
+    "editchallenge_photo_count",
     "review_submission_id",
     "review_card_chat_id",
     "review_card_message_id",
     "review_card_is_caption",
     "review_card_base_text",
+    "challenge_review_submission_id",
+    "challenge_review_card_chat_id",
+    "challenge_review_card_message_id",
+    "challenge_review_card_is_caption",
+    "challenge_review_card_base_text",
     "gui_action",
 )
 
@@ -117,12 +144,13 @@ def normalize_route_category(raw: str) -> Optional[str]:
 
 
 def _compute_competition_ranks(rows: Sequence[sqlite3.Row]) -> list[tuple[int, sqlite3.Row]]:
-    """Assigns standard competition ranks (1, 1, 3) for identical (points, tops)."""
+    """Assigns standard competition ranks (1, 1, 3) for identical (points, tops, challenges)."""
     ranked: list[tuple[int, sqlite3.Row]] = []
-    prev_score: Optional[tuple[int, int]] = None
+    prev_score: Optional[tuple[int, int, int]] = None
     current_rank = 0
     for idx, row in enumerate(rows, 1):
-        score = (int(row["points"]), int(row["tops"]))
+        challenges = int(row["challenges"]) if "challenges" in row.keys() else 0
+        score = (int(row["points"]), int(row["tops"]), challenges)
         if score != prev_score:
             current_rank = idx
             prev_score = score
@@ -146,6 +174,25 @@ def _with_menu_button(
     rows = [list(row) for row in markup.inline_keyboard]
     rows.append([InlineKeyboardButton("📋 Open Menu", callback_data="gui:menu")])
     return InlineKeyboardMarkup(rows)
+
+
+def _post_review_nav_markup(store: LeagueStore) -> InlineKeyboardMarkup:
+    """Return quick next-pending / pending-list navigation buttons after reviewing a submission."""
+    remaining = len(store.pending_submissions()) + len(store.pending_challenge_submissions())
+    if remaining > 0:
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"⏭️ Next Pending ({remaining} left)",
+                        callback_data="pending:next",
+                    ),
+                    InlineKeyboardButton("📋 Pending List", callback_data="pending:page:0"),
+                ],
+                [InlineKeyboardButton("📋 Open Menu", callback_data="gui:menu")],
+            ]
+        )
+    return _menu_button_markup()
 
 
 async def _reply_chunked(message: Any, text: str, **kwargs: Any) -> None:
@@ -211,13 +258,27 @@ def _is_admin(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id in _admin_ids())
 
 
-def _is_routesetter(update: Update) -> bool:
-    return bool(update.effective_user and update.effective_user.id in _routesetter_ids())
+def _is_routesetter(
+    update: Update, context: Optional[ContextTypes.DEFAULT_TYPE] = None
+) -> bool:
+    """Returns True if the user is a routesetter in SQLite (primary) or ROUTESETTER_IDS (.env fallback)."""
+    if not update.effective_user:
+        return False
+    uid = update.effective_user.id
+    if context is not None:
+        try:
+            if _store(context).is_routesetter(uid):
+                return True
+        except Exception:
+            pass
+    return uid in _routesetter_ids()
 
 
-def _can_manage_routes(update: Update) -> bool:
+def _can_manage_routes(
+    update: Update, context: Optional[ContextTypes.DEFAULT_TYPE] = None
+) -> bool:
     """Returns True if the user is either a routesetter or an admin."""
-    return _is_admin(update) or _is_routesetter(update)
+    return _is_admin(update) or _is_routesetter(update, context)
 
 
 def _is_registered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -225,6 +286,59 @@ def _is_registered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return bool(
         update.effective_user and _store(context).is_registered(update.effective_user.id)
     )
+
+
+def _effective_actor_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Returns the highest effective role of the user for audit logging."""
+    if _is_admin(update):
+        return "admin"
+    if _is_routesetter(update, context):
+        return "routesetter"
+    if _is_registered(update, context):
+        return "climber"
+    return "unregistered"
+
+
+def _log_action(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+    *,
+    target_type: Optional[str] = None,
+    target_id: Optional[int] = None,
+    details: Optional[str] = None,
+    role_override: Optional[str] = None,
+) -> None:
+    """Record an auditable user action in SQLite without disrupting handler execution."""
+    user = getattr(update, "effective_user", None)
+    if user is None:
+        return
+    try:
+        store = _store(context)
+        uid = int(user.id)
+        student = store.get_student(uid)
+        if student is not None:
+            actor_name = str(student["full_name"])
+            if student["username"]:
+                actor_name = f"{actor_name} (@{student['username']})"
+        else:
+            actor_name = (
+                getattr(user, "full_name", None)
+                or getattr(user, "first_name", None)
+                or str(uid)
+            )
+        role = role_override or _effective_actor_role(update, context)
+        store.add_audit_log(
+            actor_id=uid,
+            actor_name=actor_name,
+            actor_role=role,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            details=details,
+        )
+    except Exception:
+        pass
 
 
 def _unregistered_menu_keyboard() -> InlineKeyboardMarkup:
@@ -237,6 +351,10 @@ def _unregistered_menu_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("🧗 Routes", callback_data="gui:cmd:routes"),
                 InlineKeyboardButton("🔍 Route Info", callback_data="gui:cmd:route"),
+            ],
+            [
+                InlineKeyboardButton("🎯 Challenges", callback_data="gui:cmd:challenges"),
+                InlineKeyboardButton("🔎 Challenge Info", callback_data="gui:cmd:challenge"),
             ],
             [
                 InlineKeyboardButton("🏆 Leaderboard", callback_data="gui:cmd:leaderboard"),
@@ -259,18 +377,23 @@ def _climber_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🔍 Route Info", callback_data="gui:cmd:route"),
             ],
             [
-                InlineKeyboardButton("🎥 Submit Proof", callback_data="gui:cmd:submit"),
+                InlineKeyboardButton("🎯 Challenges", callback_data="gui:cmd:challenges"),
+                InlineKeyboardButton("🔎 Challenge Info", callback_data="gui:cmd:challenge"),
+            ],
+            [
+                InlineKeyboardButton("🎥 Submit Route", callback_data="gui:cmd:submit"),
+                InlineKeyboardButton("🎬 Submit Challenge", callback_data="gui:cmd:submitchallenge"),
+            ],
+            [
                 InlineKeyboardButton("↩️ Withdraw", callback_data="gui:cmd:withdraw"),
+                InlineKeyboardButton("🏆 Leaderboard", callback_data="gui:cmd:leaderboard"),
             ],
             [
                 InlineKeyboardButton("👤 My Profile", callback_data="gui:cmd:profile"),
                 InlineKeyboardButton("✏️ Edit Profile", callback_data="gui:cmd:editprofile"),
             ],
             [
-                InlineKeyboardButton("🏆 Leaderboard", callback_data="gui:cmd:leaderboard"),
                 InlineKeyboardButton("🪪 My Role", callback_data="gui:cmd:role"),
-            ],
-            [
                 InlineKeyboardButton("📖 Rules", callback_data="gui:cmd:rules"),
                 InlineKeyboardButton("⌨️ Commands", callback_data="gui:cmd:commands"),
             ],
@@ -287,8 +410,15 @@ def _routesetter_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("✏️ Edit Route", callback_data="gui:cmd:editroute"),
             ],
             [
+                InlineKeyboardButton("➕ Add Challenge", callback_data="gui:cmd:addchallenge"),
+                InlineKeyboardButton("✏️ Edit Challenge", callback_data="gui:cmd:editchallenge"),
+            ],
+            [
                 InlineKeyboardButton(
                     "📋 All Routes (incl. Inactive)", callback_data="gui:cmd:routes_all"
+                ),
+                InlineKeyboardButton(
+                    "🎯 All Challenges (incl. Inactive)", callback_data="gui:cmd:challenges_all"
                 ),
             ],
         ]
@@ -310,6 +440,10 @@ def _admin_menu_keyboard() -> InlineKeyboardMarkup:
                 ),
             ],
             [
+                InlineKeyboardButton("🔧 Routesetters", callback_data="gui:cmd:routesetters"),
+                InlineKeyboardButton("📜 Logs", callback_data="gui:cmd:logs"),
+            ],
+            [
                 InlineKeyboardButton("📊 Export CSV", callback_data="gui:cmd:export"),
                 InlineKeyboardButton("📢 Broadcast", callback_data="gui:cmd:broadcast"),
             ],
@@ -321,8 +455,6 @@ async def _send_role_menus(
     message: Any,
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    *,
-    prefix: Optional[str] = None,
 ) -> None:
     """Send the Unregistered or Climber Menu, plus Routesetter and Admin Menus as applicable."""
     if _is_registered(update, context):
@@ -332,12 +464,11 @@ async def _send_role_menus(
         primary_header = "👤 Unregistered Menu — register to unlock climber features:"
         primary_markup = _unregistered_menu_keyboard()
 
-    first_text = f"{prefix}\n\n{primary_header}" if prefix else primary_header
-    await message.reply_text(first_text, reply_markup=primary_markup)
+    await message.reply_text(primary_header, reply_markup=primary_markup)
 
-    if _can_manage_routes(update):
+    if _can_manage_routes(update, context):
         await message.reply_text(
-            "🔧 Routesetter Menu — manage climbing routes:",
+            "🔧 Routesetter Menu — manage climbing routes & challenges:",
             reply_markup=_routesetter_menu_keyboard(),
         )
     if _is_admin(update):

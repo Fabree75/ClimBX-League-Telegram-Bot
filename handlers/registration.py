@@ -23,11 +23,11 @@ from common import (
     _clear_conversation_data,
     _is_admin,
     _is_valid_email,
+    _log_action,
     _menu_button_markup,
     _parse_positive_int,
     _reply_chunked,
     _sanitize_single_line,
-    _send_role_menus,
     _store,
 )
 from store import LeagueStore
@@ -187,7 +187,7 @@ async def register_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def _complete_registration(
-    message: Any, user_id: int, context: ContextTypes.DEFAULT_TYPE
+    message: Any, user_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
     full_name = context.user_data.get("full_name")
     username = context.user_data.get("username")
@@ -201,6 +201,14 @@ async def _complete_registration(
         return ConversationHandler.END
 
     _store(context).register_student(user_id, full_name, email, username=username)
+    _log_action(
+        update,
+        context,
+        "register",
+        target_type="user",
+        target_id=user_id,
+        details=f"Registered as {full_name} ({_format_short_username(username)}, {email})",
+    )
     await message.reply_text(
         "Registration saved. Good luck climbing!",
         reply_markup=_menu_button_markup(),
@@ -225,16 +233,14 @@ async def register_confirm_callback(
         _clear_conversation_data(context)
         await query.answer("Cancelled.")
         if query.message:
-            await _send_role_menus(
-                query.message, update, context, prefix="Cancelled."
-            )
+            await query.message.reply_text("Cancelled.", reply_markup=_menu_button_markup())
         return ConversationHandler.END
 
     if data == "reg:confirm":
         await query.answer("Registration confirmed!")
         if query.message:
             return await _complete_registration(
-                query.message, update.effective_user.id, context
+                query.message, update.effective_user.id, update, context
             )
         _clear_conversation_data(context)
         return ConversationHandler.END
@@ -252,12 +258,12 @@ async def register_confirm_text(
     raw = (update.effective_message.text or "").strip().lower()
     if raw in {"yes", "y", "confirm", "ok"}:
         return await _complete_registration(
-            update.effective_message, update.effective_user.id, context
+            update.effective_message, update.effective_user.id, update, context
         )
     if raw in {"no", "n", "cancel"}:
         _clear_conversation_data(context)
-        await _send_role_menus(
-            update.effective_message, update, context, prefix="Cancelled."
+        await update.effective_message.reply_text(
+            "Cancelled.", reply_markup=_menu_button_markup()
         )
         return ConversationHandler.END
 
@@ -397,7 +403,7 @@ async def editprofile_menu_callback(
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await _send_role_menus(query.message, update, context, prefix="Cancelled.")
+        await query.message.reply_text("Cancelled.", reply_markup=_menu_button_markup())
         return ConversationHandler.END
 
     if data == "editprof:clear_username":
@@ -586,7 +592,7 @@ async def editprofile_confirm_callback(
     if data == "editprof:cancel":
         _clear_conversation_data(context)
         await query.answer("Cancelled.")
-        await _send_role_menus(query.message, update, context, prefix="Cancelled.")
+        await query.message.reply_text("Cancelled.", reply_markup=_menu_button_markup())
         return ConversationHandler.END
 
     if data == "editprof:back":
@@ -607,6 +613,14 @@ async def editprofile_confirm_callback(
 
     if not name_changed and not email_changed:
         store.update_student_username(user_id, draft_user)
+        _log_action(
+            update,
+            context,
+            "edit_profile_username",
+            target_type="user",
+            target_id=user_id,
+            details=f"Username set to {_format_short_username(draft_user)}",
+        )
         await query.answer("Profile updated!")
         u_label = f"@{draft_user}" if draft_user else "cleared (full name will be shown)"
         await query.message.reply_text(
@@ -626,6 +640,15 @@ async def editprofile_confirm_callback(
             reply_markup=_menu_button_markup(),
         )
         return ConversationHandler.END
+
+    _log_action(
+        update,
+        context,
+        "request_profile_change",
+        target_type="profile_request",
+        target_id=req_id,
+        details=f"Requested profile update #{req_id}: {draft_name} ({_format_short_username(draft_user)}, {draft_email})",
+    )
 
     await query.answer("Profile modification request submitted!")
     await query.message.reply_text(
@@ -786,6 +809,15 @@ async def review_reg_request_cmd(update: Update, context: ContextTypes.DEFAULT_T
             reply_markup=_menu_button_markup(),
         )
         return
+    _log_action(
+        update,
+        context,
+        "approve_profile_request" if is_approve else "reject_profile_request",
+        target_type="profile_request",
+        target_id=req_id,
+        details=f"Profile request #{req_id} for {reviewed['full_name']} {status}"
+        + (f" ({reason})" if reason else ""),
+    )
     await update.effective_message.reply_text(
         f"Profile modification request #{req_id} {status}.",
         reply_markup=_menu_button_markup(),
@@ -831,6 +863,14 @@ async def regreq_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("This request was already reviewed.", show_alert=True)
         return
 
+    _log_action(
+        update,
+        context,
+        "approve_profile_request" if action == "approve" else "reject_profile_request",
+        target_type="profile_request",
+        target_id=req_id,
+        details=f"Profile request #{req_id} for {reviewed['full_name']} {status}",
+    )
     await query.answer(f"Request #{req_id} {status}.")
     admin_display = update.effective_user.first_name or "Admin"
     decision_label = f"{'APPROVED ✅' if action == 'approve' else 'REJECTED ❌'} by {admin_display}"

@@ -39,6 +39,12 @@ _ROUTE_SELECT = """
     FROM routes r
     LEFT JOIN route_photos rp ON rp.route_id = r.id
 """
+_CHALLENGE_SELECT = """
+    SELECT c.id, c.name, c.description, c.points, c.active, c.created_at,
+           COUNT(cp.id) AS photo_count
+    FROM challenges c
+    LEFT JOIN challenge_photos cp ON cp.challenge_id = c.id
+"""
 _SUBMISSION_SELECT = """
     SELECT s.id, s.telegram_id, st.full_name,
            COALESCE(st.username, st.full_name) AS username,
@@ -51,6 +57,18 @@ _SUBMISSION_SELECT = """
     FROM submissions s
     JOIN students st ON st.telegram_id = s.telegram_id
     JOIN routes r ON r.id = s.route_id
+"""
+_CHALLENGE_SUBMISSION_SELECT = """
+    SELECT cs.id, cs.telegram_id, st.full_name,
+           COALESCE(st.username, st.full_name) AS username,
+           st.email, cs.challenge_id,
+           c.name AS challenge_name, c.name, c.description, c.points,
+           cs.video_file_id, cs.media_type,
+           cs.status, cs.rejection_reason,
+           cs.submitted_at, cs.reviewed_at, cs.reviewer_id
+    FROM challenge_submissions cs
+    JOIN students st ON st.telegram_id = cs.telegram_id
+    JOIN challenges c ON c.id = cs.challenge_id
 """
 
 
@@ -65,6 +83,16 @@ class Route:
     zone_points: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class Challenge:
+    id: int
+    name: str
+    points: int
+    active: bool
+    description: Optional[str] = None
+    photo_count: int = 0
+
+
 def _row_to_route(row: sqlite3.Row) -> Route:
     return Route(
         id=int(row["id"]),
@@ -74,6 +102,17 @@ def _row_to_route(row: sqlite3.Row) -> Route:
         category=str(row["category"]) if row["category"] is not None else None,
         photo_count=int(row["photo_count"]),
         zone_points=int(row["zone_points"]) if row["zone_points"] is not None else None,
+    )
+
+
+def _row_to_challenge(row: sqlite3.Row) -> Challenge:
+    return Challenge(
+        id=int(row["id"]),
+        name=str(row["name"]),
+        points=int(row["points"]),
+        active=bool(row["active"]),
+        description=str(row["description"]) if row["description"] is not None else None,
+        photo_count=int(row["photo_count"]),
     )
 
 
@@ -179,6 +218,76 @@ class LeagueStore:
                 is_caption INTEGER NOT NULL DEFAULT 1,
                 UNIQUE(submission_id, chat_id, message_id)
             );
+            CREATE TABLE IF NOT EXISTS routesetters (
+                telegram_id INTEGER PRIMARY KEY,
+                added_by INTEGER,
+                added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS challenges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT,
+                points INTEGER NOT NULL CHECK(points > 0),
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS challenge_photos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                challenge_id INTEGER NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
+                file_id TEXT NOT NULL,
+                media_type TEXT NOT NULL DEFAULT 'photo'
+                    CHECK(media_type IN ('photo', 'document')),
+                added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_challenge_photos_challenge_id
+                ON challenge_photos(challenge_id, id);
+            CREATE TABLE IF NOT EXISTS challenge_submissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL REFERENCES students(telegram_id),
+                challenge_id INTEGER NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
+                video_file_id TEXT NOT NULL,
+                media_type TEXT NOT NULL DEFAULT 'video',
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'approved', 'rejected')),
+                rejection_reason TEXT,
+                submitted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                reviewed_at TEXT,
+                reviewer_id INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_challenge_submissions_student_chal_status
+                ON challenge_submissions(telegram_id, challenge_id, status);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_challenge_submissions_pending_unique
+                ON challenge_submissions(telegram_id, challenge_id)
+                WHERE status = 'pending';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_challenge_submissions_approved_unique
+                ON challenge_submissions(telegram_id, challenge_id)
+                WHERE status = 'approved';
+            CREATE TABLE IF NOT EXISTS admin_challenge_review_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                submission_id INTEGER NOT NULL REFERENCES challenge_submissions(id) ON DELETE CASCADE,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                is_caption INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(submission_id, chat_id, message_id)
+            );
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                actor_id INTEGER NOT NULL,
+                actor_name TEXT NOT NULL,
+                actor_role TEXT NOT NULL
+                    CHECK(actor_role IN ('unregistered', 'climber', 'routesetter', 'admin')),
+                action TEXT NOT NULL,
+                target_type TEXT,
+                target_id INTEGER,
+                details TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_id_desc
+                ON audit_logs(id DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_role
+                ON audit_logs(actor_role, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_actor
+                ON audit_logs(actor_id, id DESC);
             """
         )
 
@@ -918,33 +1027,55 @@ class LeagueStore:
                 SELECT st.telegram_id,
                        st.full_name,
                        COALESCE(st.username, st.full_name) AS username,
-                       COALESCE(SUM(best.earned_points), 0) AS points,
-                       COALESCE(SUM(best.is_top), 0) AS tops,
-                       COALESCE(SUM(best.is_zone_only), 0) AS zones
+                       COALESCE(route_scores.points, 0) + COALESCE(chal_scores.points, 0) AS points,
+                       COALESCE(route_scores.tops, 0) AS tops,
+                       COALESCE(route_scores.zones, 0) AS zones,
+                       COALESCE(chal_scores.challenges, 0) AS challenges
                 FROM students st
                 LEFT JOIN (
-                    SELECT s.telegram_id,
-                           s.route_id,
-                           MAX(
+                    SELECT best.telegram_id,
+                           SUM(best.earned_points) AS points,
+                           SUM(best.is_top) AS tops,
+                           SUM(best.is_zone_only) AS zones
+                    FROM (
+                        SELECT s.telegram_id,
+                               s.route_id,
+                               MAX(
+                                   CASE
+                                       WHEN COALESCE(s.is_zone, 0) = 1
+                                           THEN COALESCE(s.awarded_points, r.zone_points, 0)
+                                       ELSE r.points
+                                   END
+                               ) AS earned_points,
+                               MAX(CASE WHEN COALESCE(s.is_zone, 0) = 0 THEN 1 ELSE 0 END) AS is_top,
                                CASE
-                                   WHEN COALESCE(s.is_zone, 0) = 1
-                                       THEN COALESCE(s.awarded_points, r.zone_points, 0)
-                                   ELSE r.points
-                               END
-                           ) AS earned_points,
-                           MAX(CASE WHEN COALESCE(s.is_zone, 0) = 0 THEN 1 ELSE 0 END) AS is_top,
-                           CASE
-                               WHEN MAX(CASE WHEN COALESCE(s.is_zone, 0) = 0 THEN 1 ELSE 0 END) = 0
-                                AND MAX(CASE WHEN COALESCE(s.is_zone, 0) = 1 THEN 1 ELSE 0 END) = 1
-                               THEN 1 ELSE 0
-                           END AS is_zone_only
-                    FROM submissions s
-                    JOIN routes r ON r.id = s.route_id
-                    WHERE s.status = 'approved'
-                    GROUP BY s.telegram_id, s.route_id
-                ) best ON best.telegram_id = st.telegram_id
-                GROUP BY st.telegram_id
-                ORDER BY points DESC, tops DESC, zones DESC,
+                                   WHEN MAX(CASE WHEN COALESCE(s.is_zone, 0) = 0 THEN 1 ELSE 0 END) = 0
+                                    AND MAX(CASE WHEN COALESCE(s.is_zone, 0) = 1 THEN 1 ELSE 0 END) = 1
+                                   THEN 1 ELSE 0
+                               END AS is_zone_only
+                        FROM submissions s
+                        JOIN routes r ON r.id = s.route_id
+                        WHERE s.status = 'approved'
+                        GROUP BY s.telegram_id, s.route_id
+                    ) best
+                    GROUP BY best.telegram_id
+                ) route_scores ON route_scores.telegram_id = st.telegram_id
+                LEFT JOIN (
+                    SELECT cbest.telegram_id,
+                           SUM(cbest.points) AS points,
+                           COUNT(*) AS challenges
+                    FROM (
+                        SELECT cs.telegram_id,
+                               cs.challenge_id,
+                               c.points AS points
+                        FROM challenge_submissions cs
+                        JOIN challenges c ON c.id = cs.challenge_id
+                        WHERE cs.status = 'approved'
+                        GROUP BY cs.telegram_id, cs.challenge_id
+                    ) cbest
+                    GROUP BY cbest.telegram_id
+                ) chal_scores ON chal_scores.telegram_id = st.telegram_id
+                ORDER BY points DESC, tops DESC, challenges DESC, zones DESC,
                          COALESCE(st.username, st.full_name) COLLATE NOCASE ASC
                 """
             )
@@ -962,13 +1093,14 @@ class LeagueStore:
             return None
 
         rankings = _compute_competition_ranks(self.leaderboard_detailed())
-        rank, points, tops, zones = 1, 0, 0, 0
+        rank, points, tops, zones, challenges_done = 1, 0, 0, 0, 0
         for comp_rank, row in rankings:
             if int(row["telegram_id"]) == telegram_id:
                 rank = comp_rank
                 points = int(row["points"])
                 tops = int(row["tops"])
                 zones = int(row["zones"])
+                challenges_done = int(row["challenges"])
                 break
 
         approved_rows = self._connection.execute(
@@ -1013,6 +1145,29 @@ class LeagueStore:
             (telegram_id,),
         ).fetchall()
 
+        approved_challenge_rows = self._connection.execute(
+            """
+            SELECT c.id, c.name, c.points, MAX(cs.reviewed_at) AS reviewed_at
+            FROM challenge_submissions cs
+            JOIN challenges c ON c.id = cs.challenge_id
+            WHERE cs.telegram_id = ? AND cs.status = 'approved'
+            GROUP BY c.id
+            ORDER BY c.id
+            """,
+            (telegram_id,),
+        ).fetchall()
+
+        pending_challenge_rows = self._connection.execute(
+            """
+            SELECT cs.id AS submission_id, c.id AS challenge_id, c.name, c.points, cs.submitted_at
+            FROM challenge_submissions cs
+            JOIN challenges c ON c.id = cs.challenge_id
+            WHERE cs.telegram_id = ? AND cs.status = 'pending'
+            ORDER BY cs.submitted_at
+            """,
+            (telegram_id,),
+        ).fetchall()
+
         raw_username = student["username"]
         return {
             "telegram_id": int(student["telegram_id"]),
@@ -1026,13 +1181,16 @@ class LeagueStore:
             "points": points,
             "tops": tops,
             "zones": zones,
+            "challenges": challenges_done,
             "approved_routes": [dict(r) for r in approved_rows],
             "zone_routes": [dict(r) for r in zone_rows],
             "pending_routes": [dict(r) for r in pending_rows],
+            "approved_challenges": [dict(r) for r in approved_challenge_rows],
+            "pending_challenges": [dict(r) for r in pending_challenge_rows],
         }
 
     def get_export_rows(self) -> list[dict[str, Any]]:
-        """Returns ranked student standings with username, full_name, email and route summaries for CSV export."""
+        """Returns ranked student standings with username, full_name, email, route and challenge summaries for CSV export."""
         rankings = _compute_competition_ranks(self.leaderboard_detailed())
         results: list[dict[str, Any]] = []
         for comp_rank, row in rankings:
@@ -1041,9 +1199,11 @@ class LeagueStore:
             profile_data = self.get_student_profile(tid)
             completed = list(profile_data["approved_routes"]) if profile_data else []
             zone_list = list(profile_data["zone_routes"]) if profile_data else []
+            chal_list = list(profile_data["approved_challenges"]) if profile_data else []
             route_summaries = [f"#{r['id']} {r['name']}" for r in completed] + [
                 f"#{r['id']} {r['name']} (Zone: {r['points']} pts)" for r in zone_list
             ]
+            chal_summaries = [f"#{c['id']} {c['name']} ({c['points']} pts)" for c in chal_list]
             results.append(
                 {
                     "rank": comp_rank,
@@ -1054,7 +1214,542 @@ class LeagueStore:
                     "points": int(row["points"]),
                     "tops": int(row["tops"]),
                     "zones": int(row["zones"]),
+                    "challenges": int(row["challenges"]),
                     "completed_routes": "; ".join(route_summaries),
+                    "completed_challenges": "; ".join(chal_summaries),
                 }
             )
         return results
+
+    # ------------------------------------------------------------------
+    # Routesetter role management
+    # ------------------------------------------------------------------
+
+    def is_routesetter(self, telegram_id: int) -> bool:
+        return (
+            self._connection.execute(
+                "SELECT 1 FROM routesetters WHERE telegram_id = ?", (telegram_id,)
+            ).fetchone()
+            is not None
+        )
+
+    def add_routesetter(
+        self, telegram_id: int, added_by: Optional[int] = None
+    ) -> bool:
+        cursor = self._connection.execute(
+            """
+            INSERT OR IGNORE INTO routesetters (telegram_id, added_by)
+            VALUES (?, ?)
+            """,
+            (telegram_id, added_by),
+        )
+        self._connection.commit()
+        return cursor.rowcount > 0
+
+    def remove_routesetter(self, telegram_id: int) -> bool:
+        cursor = self._connection.execute(
+            "DELETE FROM routesetters WHERE telegram_id = ?", (telegram_id,)
+        )
+        self._connection.commit()
+        return cursor.rowcount > 0
+
+    def list_routesetters(self) -> list[sqlite3.Row]:
+        return list(
+            self._connection.execute(
+                """
+                SELECT rs.telegram_id, rs.added_by, rs.added_at,
+                       st.full_name, st.username, st.email
+                FROM routesetters rs
+                LEFT JOIN students st ON st.telegram_id = rs.telegram_id
+                ORDER BY rs.added_at, rs.telegram_id
+                """
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Challenges CRUD, photos, submissions & review
+    # ------------------------------------------------------------------
+
+    def add_challenge(
+        self,
+        name: str,
+        points: int,
+        description: Optional[str] = None,
+        photos: Optional[Sequence[tuple[str, str] | str]] = None,
+    ) -> int:
+        cleaned_name = _sanitize_single_line(name)
+        if not cleaned_name:
+            raise ValueError("challenge name cannot be empty")
+        if points <= 0:
+            raise ValueError("points must be positive")
+        cleaned_desc = description.strip() if description and description.strip() else None
+
+        validated_photos: list[tuple[str, str]] = []
+        for item in photos or ():
+            media_type, file_id = ("photo", item) if isinstance(item, str) else item
+            if media_type not in {"photo", "document"}:
+                raise ValueError("invalid photo media_type")
+            if not file_id or not file_id.strip():
+                raise ValueError("photo file_id cannot be empty")
+            validated_photos.append((media_type, file_id.strip()))
+
+        cursor = self._connection.execute(
+            "INSERT INTO challenges (name, description, points) VALUES (?, ?, ?)",
+            (cleaned_name, cleaned_desc, int(points)),
+        )
+        challenge_id = int(cursor.lastrowid)
+        if validated_photos:
+            self._connection.executemany(
+                "INSERT INTO challenge_photos (challenge_id, file_id, media_type) VALUES (?, ?, ?)",
+                [(challenge_id, fid, mtype) for mtype, fid in validated_photos],
+            )
+        self._connection.commit()
+        return challenge_id
+
+    def update_challenge(
+        self,
+        challenge_id: int,
+        *,
+        name: Optional[str] = None,
+        description: Any = _UNSET,
+        points: Optional[int] = None,
+        active: Optional[bool] = None,
+    ) -> Optional[Challenge]:
+        challenge = self.get_challenge(challenge_id)
+        if challenge is None:
+            return None
+
+        new_name = challenge.name if name is None else _sanitize_single_line(name)
+        if not new_name:
+            raise ValueError("challenge name cannot be empty")
+
+        new_points = challenge.points if points is None else int(points)
+        if new_points <= 0:
+            raise ValueError("points must be positive")
+
+        if description is _UNSET:
+            new_desc = challenge.description
+        elif description is None:
+            new_desc = None
+        else:
+            stripped = str(description).strip()
+            new_desc = stripped if stripped else None
+
+        new_active = challenge.active if active is None else bool(active)
+
+        self._connection.execute(
+            """
+            UPDATE challenges
+            SET name = ?, description = ?, points = ?, active = ?
+            WHERE id = ?
+            """,
+            (new_name, new_desc, new_points, 1 if new_active else 0, challenge_id),
+        )
+        self._connection.commit()
+        return self.get_challenge(challenge_id)
+
+    def delete_challenge(self, challenge_id: int) -> Optional[Challenge]:
+        """Permanently deletes a challenge (and cascades photos & submissions), returning the deleted Challenge."""
+        existing = self.get_challenge(challenge_id)
+        if existing is None:
+            return None
+        self._connection.execute("DELETE FROM challenges WHERE id = ?", (challenge_id,))
+        self._connection.commit()
+        return existing
+
+    def set_challenge_active(self, challenge_id: int, active: bool) -> bool:
+        return self.update_challenge(challenge_id, active=active) is not None
+
+    def add_challenge_photo(
+        self, challenge_id: int, file_id: str, media_type: str = "photo"
+    ) -> int:
+        if self.get_challenge(challenge_id) is None:
+            raise ValueError("challenge not found")
+        if media_type not in {"photo", "document"}:
+            raise ValueError("invalid photo media_type")
+        if not file_id or not file_id.strip():
+            raise ValueError("photo file_id cannot be empty")
+        cursor = self._connection.execute(
+            "INSERT INTO challenge_photos (challenge_id, file_id, media_type) VALUES (?, ?, ?)",
+            (challenge_id, file_id.strip(), media_type),
+        )
+        self._connection.commit()
+        return int(cursor.lastrowid)
+
+    def clear_challenge_photos(self, challenge_id: int) -> int:
+        cursor = self._connection.execute(
+            "DELETE FROM challenge_photos WHERE challenge_id = ?", (challenge_id,)
+        )
+        self._connection.commit()
+        return int(cursor.rowcount)
+
+    def get_challenge_photos(self, challenge_id: int) -> list[sqlite3.Row]:
+        return list(
+            self._connection.execute(
+                """
+                SELECT id, challenge_id, file_id, media_type, added_at
+                FROM challenge_photos
+                WHERE challenge_id = ?
+                ORDER BY id
+                """,
+                (challenge_id,),
+            )
+        )
+
+    def list_challenges(self, active_only: bool = True) -> list[Challenge]:
+        where_clause = " WHERE c.active = 1" if active_only else ""
+        query = f"{_CHALLENGE_SELECT}{where_clause} GROUP BY c.id ORDER BY c.id"
+        return [_row_to_challenge(row) for row in self._connection.execute(query)]
+
+    def get_challenge(self, challenge_id: int) -> Optional[Challenge]:
+        row = self._connection.execute(
+            f"{_CHALLENGE_SELECT} WHERE c.id = ? GROUP BY c.id", (challenge_id,)
+        ).fetchone()
+        return _row_to_challenge(row) if row is not None else None
+
+    def get_challenge_details(
+        self, challenge_id: int, telegram_id: Optional[int] = None
+    ) -> Optional[dict[str, Any]]:
+        challenge = self.get_challenge(challenge_id)
+        if challenge is None:
+            return None
+        photos = self.get_challenge_photos(challenge_id)
+        counts_row = self._connection.execute(
+            """
+            SELECT
+                COUNT(DISTINCT CASE WHEN status = 'approved' THEN telegram_id END) AS completions_count,
+                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_count
+            FROM challenge_submissions
+            WHERE challenge_id = ?
+            """,
+            (challenge_id,),
+        ).fetchone()
+        return {
+            "challenge": challenge,
+            "photos": [dict(p) for p in photos],
+            "completions_count": int(counts_row["completions_count"] or 0) if counts_row else 0,
+            "pending_count": int(counts_row["pending_count"] or 0) if counts_row else 0,
+            "user_status": (
+                self.get_student_challenge_status(telegram_id, challenge_id)
+                if telegram_id is not None
+                else None
+            ),
+        }
+
+    def get_student_challenge_status(
+        self, telegram_id: int, challenge_id: int
+    ) -> Optional[str]:
+        row = self._connection.execute(
+            """
+            SELECT status
+            FROM challenge_submissions
+            WHERE telegram_id = ? AND challenge_id = ? AND status IN ('approved', 'pending')
+            ORDER BY CASE WHEN status = 'approved' THEN 1 ELSE 2 END
+            LIMIT 1
+            """,
+            (telegram_id, challenge_id),
+        ).fetchone()
+        return str(row["status"]) if row is not None else None
+
+    def get_student_challenge_statuses(self, telegram_id: int) -> dict[int, str]:
+        rows = self._connection.execute(
+            """
+            SELECT challenge_id, status
+            FROM challenge_submissions
+            WHERE telegram_id = ? AND status IN ('approved', 'pending')
+            ORDER BY CASE WHEN status = 'pending' THEN 1 ELSE 2 END
+            """,
+            (telegram_id,),
+        ).fetchall()
+        return {int(row["challenge_id"]): str(row["status"]) for row in rows}
+
+    def create_challenge_submission(
+        self,
+        telegram_id: int,
+        challenge_id: int,
+        proof_file_id: str,
+        media_type: str = "video",
+    ) -> int:
+        challenge = self.get_challenge(challenge_id)
+        if challenge is None or not challenge.active:
+            raise ValueError("challenge is not active")
+        existing = self.get_student_challenge_status(telegram_id, challenge_id)
+        if existing == "approved":
+            raise ValueError("already_approved")
+        if existing == "pending":
+            raise ValueError("already_pending")
+        if media_type not in {"video", "video_note", "document", "animation", "photo"}:
+            raise ValueError("invalid media_type")
+        if not proof_file_id or not proof_file_id.strip():
+            raise ValueError("proof_file_id cannot be empty")
+        cursor = self._connection.execute(
+            """
+            INSERT INTO challenge_submissions (telegram_id, challenge_id, video_file_id, media_type)
+            VALUES (?, ?, ?, ?)
+            """,
+            (telegram_id, challenge_id, proof_file_id, media_type),
+        )
+        self._connection.commit()
+        return int(cursor.lastrowid)
+
+    def withdraw_pending_challenge_submission(
+        self, telegram_id: int, challenge_id: int
+    ) -> Optional[dict[str, Any]]:
+        row = self._connection.execute(
+            """
+            SELECT cs.id, cs.challenge_id, c.name AS challenge_name, cs.telegram_id
+            FROM challenge_submissions cs
+            JOIN challenges c ON c.id = cs.challenge_id
+            WHERE cs.telegram_id = ? AND cs.challenge_id = ? AND cs.status = 'pending'
+            """,
+            (telegram_id, challenge_id),
+        ).fetchone()
+        if row is None:
+            return None
+        submission_id = int(row["id"])
+        admin_msgs = self.get_admin_challenge_review_messages(submission_id)
+        self._connection.execute(
+            "DELETE FROM challenge_submissions WHERE id = ? AND status = 'pending'",
+            (submission_id,),
+        )
+        self._connection.commit()
+        return {
+            "id": submission_id,
+            "challenge_id": int(row["challenge_id"]),
+            "challenge_name": str(row["challenge_name"]),
+            "telegram_id": int(row["telegram_id"]),
+            "admin_messages": admin_msgs,
+        }
+
+    def get_challenge_submission(self, submission_id: int) -> Optional[sqlite3.Row]:
+        return self._connection.execute(
+            f"{_CHALLENGE_SUBMISSION_SELECT} WHERE cs.id = ?",
+            (submission_id,),
+        ).fetchone()
+
+    def pending_challenge_submissions(self) -> list[sqlite3.Row]:
+        return list(
+            self._connection.execute(
+                f"{_CHALLENGE_SUBMISSION_SELECT} WHERE cs.status = 'pending' "
+                "ORDER BY cs.submitted_at, cs.id"
+            )
+        )
+
+    def all_challenge_submissions(
+        self, status_filter: Optional[str] = None
+    ) -> list[sqlite3.Row]:
+        flt = (status_filter or "all").strip().lower()
+        where_map = {
+            "pending": " WHERE cs.status = 'pending'",
+            "approved": " WHERE cs.status = 'approved'",
+            "rejected": " WHERE cs.status = 'rejected'",
+            "all": "",
+        }
+        if flt not in where_map:
+            raise ValueError("invalid status filter")
+        return list(
+            self._connection.execute(
+                f"{_CHALLENGE_SUBMISSION_SELECT}{where_map[flt]} ORDER BY cs.id DESC"
+            )
+        )
+
+    def review_challenge_submission(
+        self,
+        submission_id: int,
+        status: str,
+        reviewer_id: Optional[int] = None,
+        rejection_reason: Optional[str] = None,
+    ) -> Optional[sqlite3.Row]:
+        if status not in {"approved", "rejected"}:
+            raise ValueError("invalid review status")
+        sub = self.get_challenge_submission(submission_id)
+        if sub is None or str(sub["status"]) != "pending":
+            return None
+        reason = rejection_reason.strip() if rejection_reason else None
+        if status == "approved":
+            conflict = self._connection.execute(
+                """
+                SELECT id FROM challenge_submissions
+                WHERE telegram_id = ? AND challenge_id = ? AND id != ?
+                  AND status = 'approved'
+                LIMIT 1
+                """,
+                (int(sub["telegram_id"]), int(sub["challenge_id"]), submission_id),
+            ).fetchone()
+            if conflict is not None:
+                return None
+        cursor = self._connection.execute(
+            """
+            UPDATE challenge_submissions
+            SET status = ?, reviewed_at = CURRENT_TIMESTAMP,
+                reviewer_id = ?, rejection_reason = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (status, reviewer_id, reason, submission_id),
+        )
+        self._connection.commit()
+        return self.get_challenge_submission(submission_id) if cursor.rowcount > 0 else None
+
+    def reopen_challenge_submission(
+        self, submission_id: int
+    ) -> tuple[Optional[sqlite3.Row], Optional[str]]:
+        sub = self.get_challenge_submission(submission_id)
+        if sub is None:
+            return None, "not_found"
+        if str(sub["status"]) == "pending":
+            return None, "already_pending"
+        conflict = self._connection.execute(
+            """
+            SELECT id FROM challenge_submissions
+            WHERE telegram_id = ? AND challenge_id = ? AND id != ?
+              AND status IN ('pending', 'approved')
+            LIMIT 1
+            """,
+            (int(sub["telegram_id"]), int(sub["challenge_id"]), submission_id),
+        ).fetchone()
+        if conflict is not None:
+            return None, "conflict_active_submission"
+        self._connection.execute(
+            """
+            UPDATE challenge_submissions
+            SET status = 'pending', reviewed_at = NULL, reviewer_id = NULL, rejection_reason = NULL
+            WHERE id = ?
+            """,
+            (submission_id,),
+        )
+        self._connection.commit()
+        return self.get_challenge_submission(submission_id), None
+
+    def record_admin_challenge_review_message(
+        self, submission_id: int, chat_id: int, message_id: int, is_caption: bool
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO admin_challenge_review_messages
+                (submission_id, chat_id, message_id, is_caption)
+            VALUES (?, ?, ?, ?)
+            """,
+            (submission_id, chat_id, message_id, 1 if is_caption else 0),
+        )
+        self._connection.commit()
+
+    def get_admin_challenge_review_messages(self, submission_id: int) -> list[sqlite3.Row]:
+        return list(
+            self._connection.execute(
+                """
+                SELECT chat_id, message_id, is_caption
+                FROM admin_challenge_review_messages
+                WHERE submission_id = ?
+                """,
+                (submission_id,),
+            )
+        )
+
+    def delete_admin_challenge_review_messages(self, submission_id: int) -> None:
+        self._connection.execute(
+            "DELETE FROM admin_challenge_review_messages WHERE submission_id = ?",
+            (submission_id,),
+        )
+        self._connection.commit()
+
+    # ------------------------------------------------------------------
+    # Audit logs
+    # ------------------------------------------------------------------
+
+    def add_audit_log(
+        self,
+        actor_id: int,
+        actor_name: str,
+        actor_role: str,
+        action: str,
+        *,
+        target_type: Optional[str] = None,
+        target_id: Optional[int] = None,
+        details: Optional[str] = None,
+    ) -> int:
+        role = actor_role if actor_role in {"unregistered", "climber", "routesetter", "admin"} else "unregistered"
+        cleaned_name = _sanitize_single_line(actor_name) or str(actor_id)
+        cleaned_action = _sanitize_single_line(action) or "unknown"
+        cleaned_details = _sanitize_single_line(details) if details else None
+        cursor = self._connection.execute(
+            """
+            INSERT INTO audit_logs
+                (actor_id, actor_name, actor_role, action, target_type, target_id, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(actor_id),
+                cleaned_name,
+                role,
+                cleaned_action,
+                target_type,
+                int(target_id) if target_id is not None else None,
+                cleaned_details,
+            ),
+        )
+        self._connection.commit()
+        return int(cursor.lastrowid)
+
+    def _audit_where(
+        self, role_filter: Optional[str] = None, actor_id: Optional[int] = None
+    ) -> tuple[str, list[Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if role_filter and role_filter != "all":
+            if role_filter not in {"unregistered", "climber", "routesetter", "admin"}:
+                raise ValueError("invalid role filter")
+            clauses.append("actor_role = ?")
+            params.append(role_filter)
+        if actor_id is not None:
+            clauses.append("actor_id = ?")
+            params.append(int(actor_id))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, params
+
+    def count_audit_logs(
+        self, role_filter: Optional[str] = None, actor_id: Optional[int] = None
+    ) -> int:
+        where, params = self._audit_where(role_filter=role_filter, actor_id=actor_id)
+        row = self._connection.execute(
+            f"SELECT COUNT(*) AS cnt FROM audit_logs{where}", params
+        ).fetchone()
+        return int(row["cnt"]) if row else 0
+
+    def list_audit_logs(
+        self,
+        role_filter: Optional[str] = None,
+        actor_id: Optional[int] = None,
+        *,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> list[sqlite3.Row]:
+        where, params = self._audit_where(role_filter=role_filter, actor_id=actor_id)
+        params.extend([max(1, int(limit)), max(0, int(offset))])
+        return list(
+            self._connection.execute(
+                f"""
+                SELECT id, created_at, actor_id, actor_name, actor_role,
+                       action, target_type, target_id, details
+                FROM audit_logs{where}
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+                """,
+                params,
+            )
+        )
+
+    def get_all_audit_logs(
+        self, role_filter: Optional[str] = None, actor_id: Optional[int] = None
+    ) -> list[sqlite3.Row]:
+        where, params = self._audit_where(role_filter=role_filter, actor_id=actor_id)
+        return list(
+            self._connection.execute(
+                f"""
+                SELECT id, created_at, actor_id, actor_name, actor_role,
+                       action, target_type, target_id, details
+                FROM audit_logs{where}
+                ORDER BY id DESC
+                """,
+                params,
+            )
+        )

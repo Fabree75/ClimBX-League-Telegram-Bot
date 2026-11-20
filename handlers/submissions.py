@@ -17,12 +17,15 @@ from common import (
     _clear_conversation_data,
     _extract_video_info,
     _is_admin,
+    _log_action,
     _menu_button_markup,
     _parse_positive_int,
+    _post_review_nav_markup,
     _reply_chunked,
     _sanitize_single_line,
     _store,
 )
+from handlers.challenges import send_pending_challenge_review_card
 from store import LeagueStore, Route
 
 LOGGER = logging.getLogger(__name__)
@@ -36,24 +39,68 @@ def _truncate_button_label(text: str, max_len: int = 56) -> str:
     return text[: max_len - 1] + "…"
 
 
+def _unified_pending_items(store: LeagueStore) -> list[dict[str, Any]]:
+    """Return all pending route and challenge submissions merged chronologically."""
+    items: list[dict[str, Any]] = []
+    for row in store.pending_submissions():
+        items.append(
+            {
+                "kind": "route",
+                "id": int(row["id"]),
+                "submitted_at": str(row["submitted_at"] or ""),
+                "full_name": str(row["full_name"]),
+                "title": str(row["name"]),
+                "points": int(row["points"]),
+                "row": row,
+            }
+        )
+    for row in store.pending_challenge_submissions():
+        items.append(
+            {
+                "kind": "challenge",
+                "id": int(row["id"]),
+                "submitted_at": str(row["submitted_at"] or ""),
+                "full_name": str(row["full_name"]),
+                "title": str(row["challenge_name"]),
+                "points": int(row["points"]),
+                "row": row,
+            }
+        )
+    items.sort(key=lambda item: (item["submitted_at"], 0 if item["kind"] == "route" else 1, item["id"]))
+    return items
+
+
+def _format_pending_line(item: dict[str, Any]) -> str:
+    if item["kind"] == "challenge":
+        return f"🎯 Challenge #{item['id']} {item['full_name']} - {item['title']} ({item['points']} pts)"
+    return f"#{item['id']} {item['full_name']} - {item['title']} ({item['points']} pts)"
+
+
 def _pending_list_keyboard(
-    rows: list[sqlite3.Row], page: int = 0
+    items: list[dict[str, Any]], page: int = 0
 ) -> InlineKeyboardMarkup:
-    """Build interactive inline keyboard for the admin pending submission review queue."""
-    total = len(rows)
+    """Build interactive inline keyboard for the unified pending submission review queue."""
+    total = len(items)
     total_pages = max(1, (total + PENDING_PAGE_SIZE - 1) // PENDING_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
     start = page * PENDING_PAGE_SIZE
-    page_rows = rows[start : start + PENDING_PAGE_SIZE]
+    page_items = items[start : start + PENDING_PAGE_SIZE]
 
     kb: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton("▶️ Review Next Pending", callback_data="pending:next")]
     ]
-    for row in page_rows:
-        label = _truncate_button_label(
-            f"🎥 #{row['id']} {row['full_name']} — {row['name']} ({row['points']} pts)"
-        )
-        kb.append([InlineKeyboardButton(label, callback_data=f"pending:review:{row['id']}")])
+    for item in page_items:
+        if item["kind"] == "challenge":
+            label = _truncate_button_label(
+                f"🎯 #{item['id']} {item['full_name']} — {item['title']} ({item['points']} pts)"
+            )
+            cb = f"pending:review:challenge:{item['id']}"
+        else:
+            label = _truncate_button_label(
+                f"🎥 #{item['id']} {item['full_name']} — {item['title']} ({item['points']} pts)"
+            )
+            cb = f"pending:review:{item['id']}"
+        kb.append([InlineKeyboardButton(label, callback_data=cb)])
 
     if total_pages > 1:
         nav_row: list[InlineKeyboardButton] = []
@@ -81,13 +128,13 @@ def _pending_list_keyboard(
     return InlineKeyboardMarkup(kb)
 
 
-def _format_pending_page_text(rows: list[sqlite3.Row], page: int = 0) -> str:
+def _format_pending_page_text(items: list[dict[str, Any]], page: int = 0) -> str:
     """Format a paginated pending submissions view for inline message edits."""
-    total = len(rows)
+    total = len(items)
     total_pages = max(1, (total + PENDING_PAGE_SIZE - 1) // PENDING_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
     start = page * PENDING_PAGE_SIZE
-    page_rows = rows[start : start + PENDING_PAGE_SIZE]
+    page_items = items[start : start + PENDING_PAGE_SIZE]
 
     header = (
         f"⏳ Pending Submissions (Page {page + 1}/{total_pages} — {total} total):"
@@ -95,31 +142,12 @@ def _format_pending_page_text(rows: list[sqlite3.Row], page: int = 0) -> str:
         else f"⏳ Pending Submissions ({total} total):"
     )
     lines = [header, ""]
-    for row in page_rows:
-        lines.append(f"#{row['id']} {row['full_name']} - {row['name']} ({row['points']} pts)")
+    for item in page_items:
+        lines.append(_format_pending_line(item))
     lines.append(
-        "\nTap a submission below to watch video proof & review, or tap ▶️ Review Next Pending."
+        "\nTap a submission below to watch proof & review, or tap ▶️ Review Next Pending."
     )
     return "\n".join(lines)
-
-
-def _post_review_nav_markup(store: LeagueStore) -> InlineKeyboardMarkup:
-    """Return quick next-pending / pending-list navigation buttons after a review."""
-    remaining = len(store.pending_submissions())
-    if remaining > 0:
-        return InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        f"⏭️ Next Pending ({remaining} left)",
-                        callback_data="pending:next",
-                    ),
-                    InlineKeyboardButton("📋 Pending List", callback_data="pending:page:0"),
-                ],
-                [InlineKeyboardButton("📋 Open Menu", callback_data="gui:menu")],
-            ]
-        )
-    return _menu_button_markup()
 
 
 def _video_prompt_for_route(route: Route) -> str:
@@ -421,6 +449,14 @@ async def receive_proof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await message.reply_text(err_msg, reply_markup=_menu_button_markup())
         return ConversationHandler.END
 
+    _log_action(
+        update,
+        context,
+        "submit_route",
+        target_type="submission",
+        target_id=submission_id,
+        details=f"Route #{route_id} '{route.name if route else ''}' ({media_type})",
+    )
     await message.reply_text(
         f"Proof submitted (#{submission_id}). An admin will review your video.",
         reply_markup=_menu_button_markup(),
@@ -503,14 +539,23 @@ async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    _, reply_msg = await perform_withdraw(context.bot, store, user_id, route_id)
+    ok, reply_msg = await perform_withdraw(context.bot, store, user_id, route_id)
+    if ok:
+        _log_action(
+            update,
+            context,
+            "withdraw_route",
+            target_type="route",
+            target_id=route_id,
+            details=reply_msg,
+        )
     await update.effective_message.reply_text(
         reply_msg, reply_markup=_menu_button_markup()
     )
 
 
 async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List pending submissions with interactive review GUI for admins."""
+    """List pending route and challenge submissions with interactive review GUI for admins."""
     if not update.effective_message:
         return
     if not _is_admin(update):
@@ -518,23 +563,20 @@ async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Admin access required.", reply_markup=_menu_button_markup()
         )
         return
-    rows = _store(context).pending_submissions()
-    if not rows:
+    items = _unified_pending_items(_store(context))
+    if not items:
         await update.effective_message.reply_text(
             "No pending submissions.", reply_markup=_menu_button_markup()
         )
         return
-    lines = [
-        f"#{row['id']} {row['full_name']} - {row['name']} ({row['points']} pts)"
-        for row in rows
-    ]
+    lines = [_format_pending_line(item) for item in items]
     lines.append(
-        "\nTip: Tap a submission below to review, tap ▶️ Review Next Pending, or use /submission <id>."
+        "\nTip: Tap a submission below to review, tap ▶️ Review Next Pending, or use /submission <id> / /challengesubmission <id>."
     )
     await _reply_chunked(
         update.effective_message,
         "\n".join(lines),
-        reply_markup=_pending_list_keyboard(rows, page=0),
+        reply_markup=_pending_list_keyboard(items, page=0),
     )
 
 
@@ -593,7 +635,7 @@ async def _send_pending_review_card(
 
 
 async def pending_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle pending submission review GUI callbacks (pagination, pick, next)."""
+    """Handle pending submission review GUI callbacks (pagination, pick, next) for routes & challenges."""
     query = update.callback_query
     if not query or not query.message or not update.effective_chat:
         return
@@ -615,8 +657,8 @@ async def pending_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Invalid page.", show_alert=True)
             return
         page = int(parts[2])
-        rows = store.pending_submissions()
-        if not rows:
+        items = _unified_pending_items(store)
+        if not items:
             await query.answer("No pending submissions.")
             if getattr(query.message, "caption", None) is not None:
                 await query.message.reply_text(
@@ -637,8 +679,8 @@ async def pending_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         await query.answer()
-        page_text = _format_pending_page_text(rows, page=page)
-        page_kb = _pending_list_keyboard(rows, page=page)
+        page_text = _format_pending_page_text(items, page=page)
+        page_kb = _pending_list_keyboard(items, page=page)
         if getattr(query.message, "caption", None) is not None:
             await query.message.reply_text(page_text, reply_markup=page_kb)
         else:
@@ -649,10 +691,30 @@ async def pending_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if action == "review":
-        sub_id = _parse_positive_int(parts[2]) if len(parts) == 3 else None
+        if len(parts) == 4 and parts[2] in {"route", "challenge"}:
+            kind = parts[2]
+            sub_id = _parse_positive_int(parts[3])
+        elif len(parts) == 3:
+            kind = "route"
+            sub_id = _parse_positive_int(parts[2])
+        else:
+            await query.answer("Invalid submission ID.", show_alert=True)
+            return
         if sub_id is None:
             await query.answer("Invalid submission ID.", show_alert=True)
             return
+
+        if kind == "challenge":
+            sub = store.get_challenge_submission(sub_id)
+            if sub is None or str(sub["status"]) != "pending":
+                await query.answer("This submission was already reviewed.", show_alert=True)
+                return
+            await query.answer()
+            await send_pending_challenge_review_card(
+                context.bot, store, update.effective_chat.id, query.message, sub
+            )
+            return
+
         sub = store.get_submission(sub_id)
         if sub is None or str(sub["status"]) != "pending":
             await query.answer("This submission was already reviewed.", show_alert=True)
@@ -664,8 +726,8 @@ async def pending_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if action == "next":
-        rows = store.pending_submissions()
-        if not rows:
+        items = _unified_pending_items(store)
+        if not items:
             await query.answer("No pending submissions left!", show_alert=True)
             await query.message.reply_text(
                 "✅ All pending submissions have been reviewed!",
@@ -673,23 +735,37 @@ async def pending_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             return
 
-        after_id = _parse_positive_int(parts[2]) if len(parts) == 3 else None
-        target = rows[0]
-        if after_id is not None:
-            if len(rows) == 1 and int(rows[0]["id"]) == after_id:
+        after_key: Optional[tuple[str, int]] = None
+        if len(parts) == 4 and parts[2] in {"route", "challenge"}:
+            aid = _parse_positive_int(parts[3])
+            if aid is not None:
+                after_key = (parts[2], aid)
+        elif len(parts) == 3:
+            aid = _parse_positive_int(parts[2])
+            if aid is not None:
+                after_key = ("route", aid)
+
+        target = items[0]
+        if after_key is not None:
+            keys = [(it["kind"], it["id"]) for it in items]
+            if len(items) == 1 and keys[0] == after_key:
                 await query.answer(
                     "No other pending submissions in the queue.", show_alert=True
                 )
                 return
-            ids = [int(r["id"]) for r in rows]
-            if after_id in ids:
-                next_idx = (ids.index(after_id) + 1) % len(rows)
-                target = rows[next_idx]
+            if after_key in keys:
+                next_idx = (keys.index(after_key) + 1) % len(items)
+                target = items[next_idx]
 
         await query.answer()
-        await _send_pending_review_card(
-            context.bot, store, update.effective_chat.id, query.message, target
-        )
+        if target["kind"] == "challenge":
+            await send_pending_challenge_review_card(
+                context.bot, store, update.effective_chat.id, query.message, target["row"]
+            )
+        else:
+            await _send_pending_review_card(
+                context.bot, store, update.effective_chat.id, query.message, target["row"]
+            )
         return
 
     await query.answer("Invalid pending action.", show_alert=True)
@@ -1048,6 +1124,15 @@ async def review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    _log_action(
+        update,
+        context,
+        "approve_submission" if is_approve else "reject_submission",
+        target_type="submission",
+        target_id=submission_id,
+        details=f"Submission #{submission_id} ({submission['full_name']} — {submission['route_name']}) {status}"
+        + (f" ({rejection_reason})" if rejection_reason else ""),
+    )
     await update.effective_message.reply_text(
         f"Submission #{submission_id} {status}.",
         reply_markup=_menu_button_markup(),
@@ -1121,6 +1206,14 @@ async def zone_review_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     awarded = int(reviewed["awarded_points"])
+    _log_action(
+        update,
+        context,
+        "zone_submission",
+        target_type="submission",
+        target_id=submission_id,
+        details=f"Submission #{submission_id} ({reviewed['full_name']} — {reviewed['route_name']}) awarded Zone ({awarded} pts)",
+    )
     await update.effective_message.reply_text(
         f"Submission #{submission_id} awarded Zone ({awarded} pts).",
         reply_markup=_menu_button_markup(),
@@ -1228,6 +1321,14 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("This submission was already reviewed.", show_alert=True)
             return
         awarded = int(submission["awarded_points"])
+        _log_action(
+            update,
+            context,
+            "zone_submission",
+            target_type="submission",
+            target_id=submission_id,
+            details=f"Submission #{submission_id} ({submission['full_name']} — {submission['route_name']}) awarded Zone ({awarded} pts)",
+        )
         await query.answer(f"Submission #{submission_id} awarded Zone ({awarded} pts).")
         await _finalize_submission_review(
             context.bot,
@@ -1255,6 +1356,14 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("This submission was already reviewed.", show_alert=True)
         return
 
+    _log_action(
+        update,
+        context,
+        "approve_submission" if action == "approve" else "reject_submission",
+        target_type="submission",
+        target_id=submission_id,
+        details=f"Submission #{submission_id} ({submission['full_name']} — {submission['route_name']}) {status}",
+    )
     await query.answer(f"Submission #{submission_id} {status}.")
     decision_text = "APPROVED ✅" if action == "approve" else "REJECTED ❌"
     await _finalize_submission_review(
@@ -1360,6 +1469,14 @@ async def review_reject_reason_text(
         )
         return ConversationHandler.END
 
+    _log_action(
+        update,
+        context,
+        "reject_submission",
+        target_type="submission",
+        target_id=int(sub_id),
+        details=f"Submission #{sub_id} ({submission['full_name']} — {submission['route_name']}) rejected: {reason}",
+    )
     await update.effective_message.reply_text(
         f"Submission #{sub_id} rejected (Reason: {reason}).",
         reply_markup=_post_review_nav_markup(store),
@@ -1416,6 +1533,14 @@ async def reopen_submission_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
+    _log_action(
+        update,
+        context,
+        "reopen_submission",
+        target_type="submission",
+        target_id=submission_id,
+        details=f"Reopened submission #{submission_id} ({sub['full_name']} — {sub['route_name']})",
+    )
     await update.effective_message.reply_text(
         f"Submission #{submission_id} reopened to pending. Use /submission {submission_id} to review it.",
         reply_markup=_menu_button_markup(),

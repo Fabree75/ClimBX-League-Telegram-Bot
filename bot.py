@@ -29,11 +29,24 @@ from telegram.ext import (
 from telegram.warnings import PTBUserWarning
 
 from common import (
+    ADDCHALLENGE_DESCRIPTION,
+    ADDCHALLENGE_NAME,
+    ADDCHALLENGE_PHOTOS,
+    ADDCHALLENGE_POINTS,
     ADDROUTE_CATEGORY,
     ADDROUTE_NAME,
     ADDROUTE_PHOTOS,
     ADDROUTE_POINTS,
     ADDROUTE_ZONE,
+    ADDROUTESETTER_INPUT,
+    CHALLENGE_REVIEW_REJECT_REASON,
+    EDITCHALLENGE_DELETE_CONFIRM,
+    EDITCHALLENGE_DESCRIPTION,
+    EDITCHALLENGE_MENU,
+    EDITCHALLENGE_NAME,
+    EDITCHALLENGE_PHOTOS,
+    EDITCHALLENGE_POINTS,
+    EDITCHALLENGE_SELECT,
     EDITPROFILE_CONFIRM,
     EDITPROFILE_EMAIL,
     EDITPROFILE_MENU,
@@ -59,6 +72,8 @@ from common import (
     ROUTE_CATEGORIES,
     SAFE_MESSAGE_CHUNK_LENGTH,
     SQLITE_MAX_INT,
+    SUBMIT_CHALLENGE,
+    SUBMIT_CHALLENGE_PROOF,
     SUBMIT_PROOF,
     SUBMIT_ROUTE,
     _admin_ids,
@@ -72,6 +87,7 @@ from common import (
     _is_registered,
     _is_routesetter,
     _is_valid_email,
+    _log_action,
     _menu_button_markup,
     _non_text_prompt,
     _parse_positive_int,
@@ -83,7 +99,50 @@ from common import (
     _with_menu_button,
     normalize_route_category,
 )
+from handlers.challenges import (
+    add_challenge_caption_entry,
+    add_challenge_entry,
+    addchallenge_description_skip,
+    addchallenge_description_text,
+    addchallenge_name,
+    addchallenge_photos_callback,
+    addchallenge_photos_done,
+    addchallenge_points,
+    addchallenge_receive_photo,
+    all_challenge_submissions_cmd,
+    challenge_info_cmd,
+    challenge_review_callback,
+    challenge_review_prompt_entry_callback,
+    challenge_review_reject_reason_text,
+    challenge_view_callback,
+    challenges_cmd,
+    edit_challenge_entry,
+    editchallenge_delete_confirm_callback,
+    editchallenge_description_callback,
+    editchallenge_description_text,
+    editchallenge_done_cmd,
+    editchallenge_menu_callback,
+    editchallenge_name_text,
+    editchallenge_photos_callback,
+    editchallenge_photos_done,
+    editchallenge_points_text,
+    editchallenge_receive_photo,
+    editchallenge_select_callback,
+    editchallenge_select_text,
+    receive_challenge_proof,
+    reopen_challenge_submission_cmd,
+    review_challenge_cmd,
+    submit_challenge_entry_callback,
+    submit_challenge_select_callback,
+    submit_challenge_select_text,
+    submit_challenge_start,
+    view_challenge_submission_cmd,
+    withdraw_challenge_cmd,
+)
 from handlers.general import (
+    addroutesetter_cmd,
+    addroutesetter_pick_callback,
+    addroutesetter_text,
     broadcast,
     cancel,
     cancel_idle,
@@ -93,9 +152,14 @@ from handlers.general import (
     gui_conversation_entry_callback,
     gui_prompt_input_text,
     leaderboard,
+    logs_callback,
+    logs_cmd,
     menu_command,
     profile,
+    removeroutesetter_cmd,
     role_status,
+    routesetter_callback,
+    routesetters_cmd,
     rules_command,
     start,
 )
@@ -167,7 +231,7 @@ from handlers.submissions import (
     withdraw,
     zone_review_cmd,
 )
-from store import LeagueStore, Route
+from store import Challenge, LeagueStore, Route
 
 LOGGER = logging.getLogger(__name__)
 
@@ -190,6 +254,7 @@ __all__ = [
     "EDITROUTE_SELECT",
     "EDITROUTE_ZONE",
     "GUI_PROMPT_INPUT",
+    "Challenge",
     "LeagueStore",
     "MAX_MEDIA_GROUP_SIZE",
     "MAX_TELEGRAM_CAPTION_LENGTH",
@@ -243,14 +308,17 @@ async def _post_init(application: Application) -> None:
         BotCommand("menu", "Open interactive role-based GUI menus"),
         BotCommand("routes", "View climbing routes & categories"),
         BotCommand("route", "View full info & pictures of a route"),
+        BotCommand("challenges", "View climbing challenges"),
+        BotCommand("challenge", "View full info & pictures of a challenge"),
         BotCommand("submit", "Submit video proof for a route"),
+        BotCommand("submitchallenge", "Submit video or photo proof for a challenge"),
         BotCommand("withdraw", "Withdraw a pending submission"),
         BotCommand("leaderboard", "View league rankings"),
-        BotCommand("profile", "View your personal score and completed routes"),
+        BotCommand("profile", "View your personal score and completed climbs"),
         BotCommand("editprofile", "Edit your username or request profile changes"),
         BotCommand("register", "Join the league (@polytechnique.edu)"),
         BotCommand("role", "Check your role (Unregistered, Climber, Routesetter, Admin)"),
-        BotCommand("rules", "View competition rules & video proof requirements"),
+        BotCommand("rules", "View competition rules & proof requirements"),
         BotCommand("commands", "View available slash commands for your role"),
         BotCommand("cancel", "Cancel current action"),
     ]
@@ -286,6 +354,9 @@ def build_application(
     store = LeagueStore(database_path)
     image_filter = MSG_COMMAND_FILTER & (filters.PHOTO | filters.Document.IMAGE)
     addroute_caption_filter = image_filter & filters.CaptionRegex(r"^/addroute(@\w+)?(\s|$)")
+    addchallenge_caption_filter = image_filter & filters.CaptionRegex(
+        r"^/addchallenge(@\w+)?(\s|$)"
+    )
 
     text_msg = MSG_COMMAND_FILTER & filters.TEXT & ~filters.COMMAND
     non_text_msg = MSG_COMMAND_FILTER & ~filters.TEXT & ~filters.COMMAND
@@ -301,16 +372,30 @@ def build_application(
                 CommandHandler("register", register_start, filters=MSG_COMMAND_FILTER),
                 CommandHandler("editprofile", editprofile_start, filters=MSG_COMMAND_FILTER),
                 CommandHandler("submit", submit_start, filters=MSG_COMMAND_FILTER),
+                CommandHandler(
+                    "submitchallenge", submit_challenge_start, filters=MSG_COMMAND_FILTER
+                ),
                 CommandHandler("addroute", add_route_entry, filters=MSG_COMMAND_FILTER),
                 MessageHandler(addroute_caption_filter, add_route_caption_entry),
                 CommandHandler("editroute", edit_route_entry, filters=MSG_COMMAND_FILTER),
+                CommandHandler("addchallenge", add_challenge_entry, filters=MSG_COMMAND_FILTER),
+                MessageHandler(addchallenge_caption_filter, add_challenge_caption_entry),
+                CommandHandler("editchallenge", edit_challenge_entry, filters=MSG_COMMAND_FILTER),
+                CallbackQueryHandler(
+                    submit_challenge_entry_callback,
+                    pattern=r"^subchal:start:[0-9]+$",
+                ),
                 CallbackQueryHandler(
                     review_prompt_entry_callback,
                     pattern=r"^review:reject_reason:[0-9]+$",
                 ),
                 CallbackQueryHandler(
+                    challenge_review_prompt_entry_callback,
+                    pattern=r"^creview:reject_reason:[0-9]+$",
+                ),
+                CallbackQueryHandler(
                     gui_conversation_entry_callback,
-                    pattern=r"^gui:cmd:(register|editprofile|submit|addroute|editroute|broadcast)$",
+                    pattern=r"^gui:cmd:(register|editprofile|submit|submitchallenge|addroute|editroute|addchallenge|editchallenge|addroutesetter|broadcast)$",
                 ),
             ],
             states={
@@ -582,6 +667,201 @@ def build_application(
                         ),
                     ),
                 ],
+                SUBMIT_CHALLENGE: [
+                    CallbackQueryHandler(
+                        submit_challenge_select_callback,
+                        pattern=r"^subchal:pick:[0-9]+$",
+                    ),
+                    MessageHandler(text_msg, submit_challenge_select_text),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please tap a challenge button above or reply with a valid numeric challenge ID, or /cancel.",
+                            SUBMIT_CHALLENGE,
+                        ),
+                    ),
+                ],
+                SUBMIT_CHALLENGE_PROOF: [
+                    MessageHandler(
+                        MSG_COMMAND_FILTER & filters.ALL & ~filters.COMMAND,
+                        receive_challenge_proof,
+                    )
+                ],
+                ADDCHALLENGE_NAME: [
+                    MessageHandler(text_msg, addchallenge_name),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please send the challenge name as text, or /cancel.",
+                            ADDCHALLENGE_NAME,
+                        ),
+                    ),
+                ],
+                ADDCHALLENGE_DESCRIPTION: [
+                    CallbackQueryHandler(
+                        addchallenge_description_skip,
+                        pattern=r"^addchal:(skipdesc|cancel)$",
+                    ),
+                    CommandHandler(
+                        "skip", addchallenge_description_skip, filters=MSG_COMMAND_FILTER
+                    ),
+                    MessageHandler(text_msg, addchallenge_description_text),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please send the challenge description as text (or tap Skip Description ➡️ / /skip), or /cancel.",
+                            ADDCHALLENGE_DESCRIPTION,
+                        ),
+                    ),
+                ],
+                ADDCHALLENGE_POINTS: [
+                    MessageHandler(text_msg, addchallenge_points),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please enter the points as a positive number, or /cancel.",
+                            ADDCHALLENGE_POINTS,
+                        ),
+                    ),
+                ],
+                ADDCHALLENGE_PHOTOS: [
+                    CallbackQueryHandler(
+                        addchallenge_photos_callback,
+                        pattern=r"^addchal:(done|cancel)$",
+                    ),
+                    CommandHandler(
+                        ["done", "skip"],
+                        addchallenge_photos_done,
+                        filters=MSG_COMMAND_FILTER,
+                    ),
+                    MessageHandler(
+                        image_filter & ~filters.COMMAND, addchallenge_receive_photo
+                    ),
+                    MessageHandler(
+                        MSG_COMMAND_FILTER & filters.ALL & ~filters.COMMAND,
+                        _non_text_prompt(
+                            "Please send a picture (photo), or send /done (or /skip) to publish, or /cancel.",
+                            ADDCHALLENGE_PHOTOS,
+                        ),
+                    ),
+                ],
+                EDITCHALLENGE_SELECT: [
+                    CallbackQueryHandler(
+                        editchallenge_select_callback,
+                        pattern=r"^editchal:(pick:[0-9]+|cancel)$",
+                    ),
+                    MessageHandler(text_msg, editchallenge_select_text),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please select a challenge button above or reply with a challenge ID, or /cancel.",
+                            EDITCHALLENGE_SELECT,
+                        ),
+                    ),
+                ],
+                EDITCHALLENGE_MENU: [
+                    CallbackQueryHandler(editchallenge_menu_callback, pattern=r"^editchal:"),
+                    CommandHandler("done", editchallenge_done_cmd, filters=MSG_COMMAND_FILTER),
+                    MessageHandler(
+                        MSG_COMMAND_FILTER & filters.ALL & ~filters.COMMAND,
+                        _non_text_prompt(
+                            "Please tap one of the edit buttons above (or send /done or /cancel).",
+                            EDITCHALLENGE_MENU,
+                        ),
+                    ),
+                ],
+                EDITCHALLENGE_NAME: [
+                    MessageHandler(text_msg, editchallenge_name_text),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please send the new challenge name as text, or /cancel.",
+                            EDITCHALLENGE_NAME,
+                        ),
+                    ),
+                ],
+                EDITCHALLENGE_DESCRIPTION: [
+                    CallbackQueryHandler(
+                        editchallenge_description_callback,
+                        pattern=r"^editchal:(cleardesc|back)$",
+                    ),
+                    MessageHandler(text_msg, editchallenge_description_text),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please send the new challenge description as text (or 'none' to clear), or /cancel.",
+                            EDITCHALLENGE_DESCRIPTION,
+                        ),
+                    ),
+                ],
+                EDITCHALLENGE_POINTS: [
+                    MessageHandler(text_msg, editchallenge_points_text),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please enter the points as a positive number, or /cancel.",
+                            EDITCHALLENGE_POINTS,
+                        ),
+                    ),
+                ],
+                EDITCHALLENGE_PHOTOS: [
+                    CallbackQueryHandler(
+                        editchallenge_photos_callback,
+                        pattern=r"^editchal:photos_done$",
+                    ),
+                    CommandHandler(
+                        ["done", "skip"],
+                        editchallenge_photos_done,
+                        filters=MSG_COMMAND_FILTER,
+                    ),
+                    MessageHandler(
+                        image_filter & ~filters.COMMAND, editchallenge_receive_photo
+                    ),
+                    MessageHandler(
+                        MSG_COMMAND_FILTER & filters.ALL & ~filters.COMMAND,
+                        _non_text_prompt(
+                            "Please send a picture (photo), or send /done when finished, or /cancel.",
+                            EDITCHALLENGE_PHOTOS,
+                        ),
+                    ),
+                ],
+                EDITCHALLENGE_DELETE_CONFIRM: [
+                    CallbackQueryHandler(
+                        editchallenge_delete_confirm_callback,
+                        pattern=r"^editchal:(delete_confirm|delete_back)$",
+                    ),
+                    MessageHandler(
+                        MSG_COMMAND_FILTER & filters.ALL & ~filters.COMMAND,
+                        _non_text_prompt(
+                            "Please tap Confirm Delete 🗑️ or Back ⬅️ above, or /cancel.",
+                            EDITCHALLENGE_DELETE_CONFIRM,
+                        ),
+                    ),
+                ],
+                CHALLENGE_REVIEW_REJECT_REASON: [
+                    MessageHandler(text_msg, challenge_review_reject_reason_text),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please send the rejection reason as text, or /cancel.",
+                            CHALLENGE_REVIEW_REJECT_REASON,
+                        ),
+                    ),
+                ],
+                ADDROUTESETTER_INPUT: [
+                    CallbackQueryHandler(
+                        addroutesetter_pick_callback,
+                        pattern=r"^rs:(add:[0-9]+|cancel)$",
+                    ),
+                    MessageHandler(text_msg, addroutesetter_text),
+                    MessageHandler(
+                        non_text_msg,
+                        _non_text_prompt(
+                            "Please select a climber above or send a numeric Telegram ID, or /cancel.",
+                            ADDROUTESETTER_INPUT,
+                        ),
+                    ),
+                ],
             },
             fallbacks=[CommandHandler("cancel", cancel, filters=MSG_COMMAND_FILTER)],
             allow_reentry=True,
@@ -606,7 +886,14 @@ def build_application(
             CommandHandler(["role", "admin"], role_status, filters=MSG_COMMAND_FILTER),
             CommandHandler("routes", routes, filters=MSG_COMMAND_FILTER),
             CommandHandler(["route", "routeinfo"], route_info, filters=MSG_COMMAND_FILTER),
+            CommandHandler("challenges", challenges_cmd, filters=MSG_COMMAND_FILTER),
+            CommandHandler(
+                ["challenge", "challengeinfo"], challenge_info_cmd, filters=MSG_COMMAND_FILTER
+            ),
             CommandHandler("withdraw", withdraw, filters=MSG_COMMAND_FILTER),
+            CommandHandler(
+                "withdrawchallenge", withdraw_challenge_cmd, filters=MSG_COMMAND_FILTER
+            ),
             CommandHandler(["profile", "me"], profile, filters=MSG_COMMAND_FILTER),
             CommandHandler("pending", pending, filters=MSG_COMMAND_FILTER),
             CommandHandler(
@@ -618,6 +905,40 @@ def build_application(
             CommandHandler(["approve", "reject"], review, filters=MSG_COMMAND_FILTER),
             CommandHandler(["zone", "partial"], zone_review_cmd, filters=MSG_COMMAND_FILTER),
             CommandHandler("reopen", reopen_submission_cmd, filters=MSG_COMMAND_FILTER),
+            CommandHandler(
+                ["challengesubmissions", "allchallengesubmissions"],
+                all_challenge_submissions_cmd,
+                filters=MSG_COMMAND_FILTER,
+            ),
+            CommandHandler(
+                ["challengesubmission", "viewchallenge"],
+                view_challenge_submission_cmd,
+                filters=MSG_COMMAND_FILTER,
+            ),
+            CommandHandler(
+                ["approvechallenge", "rejectchallenge"],
+                review_challenge_cmd,
+                filters=MSG_COMMAND_FILTER,
+            ),
+            CommandHandler(
+                "reopenchallenge",
+                reopen_challenge_submission_cmd,
+                filters=MSG_COMMAND_FILTER,
+            ),
+            CommandHandler(
+                ["routesetters", "setters"], routesetters_cmd, filters=MSG_COMMAND_FILTER
+            ),
+            CommandHandler(
+                ["addroutesetter", "setroutesetter"],
+                addroutesetter_cmd,
+                filters=MSG_COMMAND_FILTER,
+            ),
+            CommandHandler(
+                ["removeroutesetter", "delroutesetter"],
+                removeroutesetter_cmd,
+                filters=MSG_COMMAND_FILTER,
+            ),
+            CommandHandler(["logs", "auditlogs"], logs_cmd, filters=MSG_COMMAND_FILTER),
             CommandHandler(
                 ["profilerequests", "regrequests"],
                 regrequests_cmd,
@@ -636,17 +957,29 @@ def build_application(
                 pattern=r"^review:(approve|reject|reject_now|zone|zone_preset|back):[0-9]+$",
             ),
             CallbackQueryHandler(
+                challenge_review_callback,
+                pattern=r"^creview:(approve|reject|reject_now|back):[0-9]+$",
+            ),
+            CallbackQueryHandler(
                 pending_callback,
-                pattern=r"^pending:(page:[0-9]+|review:[0-9]+|next(:[0-9]+)?)$",
+                pattern=r"^pending:(page:[0-9]+|review:(route:|challenge:)?[0-9]+|next(:(route:|challenge:)?[0-9]+)?)$",
             ),
             CallbackQueryHandler(
                 regreq_callback, pattern=r"^regreq:(approve|reject):[0-9]+$"
             ),
             CallbackQueryHandler(route_view_callback, pattern=r"^route:view:[0-9]+$"),
+            CallbackQueryHandler(
+                challenge_view_callback, pattern=r"^challenge:view:[0-9]+$"
+            ),
+            CallbackQueryHandler(routesetter_callback, pattern=r"^rs:remove:[0-9]+$"),
+            CallbackQueryHandler(
+                logs_callback,
+                pattern=r"^logs:(filter:(all|climber|routesetter|admin):[0-9]+|export:(all|climber|routesetter|admin))$",
+            ),
             CallbackQueryHandler(gui_callback, pattern=r"^gui:"),
             CallbackQueryHandler(
                 stale_addroute_callback,
-                pattern=r"^(addroute|editroute|reg|editprof):",
+                pattern=r"^(addroute|editroute|addchal|editchal|subchal|reg|editprof|rs):",
             ),
         ]
     )

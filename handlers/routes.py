@@ -33,11 +33,11 @@ from common import (
     _clear_conversation_data,
     _extract_command_and_args,
     _extract_photo_info,
+    _log_action,
     _menu_button_markup,
     _parse_positive_int,
     _reply_chunked,
     _sanitize_single_line,
-    _send_role_menus,
     _store,
     normalize_route_category,
 )
@@ -61,11 +61,11 @@ async def routes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = list(context.args or [])
     show_all = False
     if args and args[0].lower() == "all":
-        if _can_manage_routes(update):
+        if _can_manage_routes(update, context):
             show_all = True
         args = args[1:]
     elif args and len(args) > 1 and args[-1].lower() == "all":
-        if _can_manage_routes(update):
+        if _can_manage_routes(update, context):
             show_all = True
         args = args[:-1]
 
@@ -481,7 +481,7 @@ async def add_route_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Start /addroute interactively or publish immediately when arguments are provided."""
     if not update.effective_message:
         return ConversationHandler.END
-    if not _can_manage_routes(update):
+    if not _can_manage_routes(update, context):
         await update.effective_message.reply_text(
             "Routesetter or admin access required.",
             reply_markup=_menu_button_markup(),
@@ -502,6 +502,16 @@ async def add_route_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     _clear_conversation_data(context)
     name, points, category = parsed
     route_id = _store(context).add_route(name, points, category=category)
+    _log_action(
+        update,
+        context,
+        "add_route",
+        target_type="route",
+        target_id=route_id,
+        details=f"Route #{route_id} '{name}' ({points} pts"
+        + (f", {category}" if category else "")
+        + ")",
+    )
     await update.effective_message.reply_text(
         _format_published_message(route_id, category, points, 0),
         reply_markup=_menu_button_markup(),
@@ -519,7 +529,7 @@ async def add_route_caption_entry(update: Update, context: ContextTypes.DEFAULT_
     if parsed_cmd is None or parsed_cmd[0] != "addroute":
         return ConversationHandler.END
 
-    if not _can_manage_routes(update):
+    if not _can_manage_routes(update, context):
         await message.reply_text(
             "Routesetter or admin access required.",
             reply_markup=_menu_button_markup(),
@@ -551,6 +561,16 @@ async def add_route_caption_entry(update: Update, context: ContextTypes.DEFAULT_
     route_id = _store(context).add_route(
         name, points, category=category, photos=[(media_type, file_id)]
     )
+    _log_action(
+        update,
+        context,
+        "add_route",
+        target_type="route",
+        target_id=route_id,
+        details=f"Route #{route_id} '{name}' ({points} pts"
+        + (f", {category}" if category else "")
+        + ", 1 photo)",
+    )
     await message.reply_text(
         _format_published_message(route_id, category, points, 1),
         reply_markup=_menu_button_markup(),
@@ -568,7 +588,7 @@ async def _cancel_addroute_callback(
     except Exception:
         pass
     if query.message:
-        await _send_role_menus(query.message, update, context, prefix="Cancelled.")
+        await query.message.reply_text("Cancelled.", reply_markup=_menu_button_markup())
     return ConversationHandler.END
 
 
@@ -602,7 +622,7 @@ async def addroute_category_callback(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     if not query:
         return ConversationHandler.END
-    if not _can_manage_routes(update):
+    if not _can_manage_routes(update, context):
         await query.answer("Routesetter or admin access required.", show_alert=True)
         return ConversationHandler.END
 
@@ -747,7 +767,7 @@ async def addroute_zone_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     if not query:
         return ConversationHandler.END
-    if not _can_manage_routes(update):
+    if not _can_manage_routes(update, context):
         await query.answer("Routesetter or admin access required.", show_alert=True)
         return ConversationHandler.END
     await query.answer()
@@ -810,7 +830,9 @@ async def addroute_receive_photo(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 
-async def _finalize_addroute(message: Any, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def _finalize_addroute(
+    message: Any, update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
     category = context.user_data.get("addroute_category")
     name = context.user_data.get("addroute_name")
     points = context.user_data.get("addroute_points")
@@ -834,6 +856,17 @@ async def _finalize_addroute(message: Any, context: ContextTypes.DEFAULT_TYPE) -
         photos=photos,
         zone_points=z_int,
     )
+    _log_action(
+        update,
+        context,
+        "add_route",
+        target_type="route",
+        target_id=route_id,
+        details=f"Route #{route_id} '{name}' ({pts_int} pts"
+        + (f", {category}" if category else "")
+        + (f", zone {z_int}" if z_int else "")
+        + f", {len(photos)} photos)",
+    )
     await message.reply_text(
         _format_published_message(
             route_id,
@@ -851,7 +884,7 @@ async def addroute_photos_done(update: Update, context: ContextTypes.DEFAULT_TYP
     """Publish route when /done or /skip is sent."""
     if not update.effective_message:
         return ConversationHandler.END
-    return await _finalize_addroute(update.effective_message, context)
+    return await _finalize_addroute(update.effective_message, update, context)
 
 
 async def addroute_photos_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -859,7 +892,7 @@ async def addroute_photos_callback(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     if not query:
         return ConversationHandler.END
-    if not _can_manage_routes(update):
+    if not _can_manage_routes(update, context):
         await query.answer("Routesetter or admin access required.", show_alert=True)
         return ConversationHandler.END
 
@@ -897,7 +930,7 @@ async def addroute_photos_callback(update: Update, context: ContextTypes.DEFAULT
         except Exception:
             pass
         if query.message:
-            return await _finalize_addroute(query.message, context)
+            return await _finalize_addroute(query.message, update, context)
         _clear_conversation_data(context)
         return ConversationHandler.END
 
@@ -1011,7 +1044,7 @@ async def edit_route_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Start /editroute [route_id] for routesetters and admins."""
     if not update.effective_message:
         return ConversationHandler.END
-    if not _can_manage_routes(update):
+    if not _can_manage_routes(update, context):
         await update.effective_message.reply_text(
             "Routesetter or admin access required.",
             reply_markup=_menu_button_markup(),
@@ -1047,7 +1080,7 @@ async def editroute_select_callback(
     query = update.callback_query
     if not query or not query.message:
         return ConversationHandler.END
-    if not _can_manage_routes(update):
+    if not _can_manage_routes(update, context):
         await query.answer("Routesetter or admin access required.", show_alert=True)
         return ConversationHandler.END
 
@@ -1060,7 +1093,7 @@ async def editroute_select_callback(
     if data == "editroute:cancel":
         _clear_conversation_data(context)
         await query.answer("Cancelled.")
-        await _send_role_menus(query.message, update, context, prefix="Cancelled.")
+        await query.message.reply_text("Cancelled.", reply_markup=_menu_button_markup())
         return ConversationHandler.END
 
     parts = data.split(":")
@@ -1079,7 +1112,7 @@ async def editroute_select_text(
     """Handle typed route number in EDITROUTE_SELECT."""
     if not update.effective_message:
         return ConversationHandler.END
-    if not _can_manage_routes(update):
+    if not _can_manage_routes(update, context):
         _clear_conversation_data(context)
         await update.effective_message.reply_text(
             "Routesetter or admin access required.",
@@ -1103,7 +1136,7 @@ async def editroute_menu_callback(
     query = update.callback_query
     if not query or not query.message:
         return ConversationHandler.END
-    if not _can_manage_routes(update):
+    if not _can_manage_routes(update, context):
         await query.answer("Routesetter or admin access required.", show_alert=True)
         return ConversationHandler.END
 
@@ -1123,7 +1156,7 @@ async def editroute_menu_callback(
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await _send_role_menus(query.message, update, context, prefix="Cancelled.")
+        await query.message.reply_text("Cancelled.", reply_markup=_menu_button_markup())
         return ConversationHandler.END
 
     if data == "editroute:done":
@@ -1142,6 +1175,14 @@ async def editroute_menu_callback(
     if data == "editroute:toggle":
         updated = store.update_route(route.id, active=not route.active)
         state_str = "reactivated" if (updated and updated.active) else "deactivated"
+        _log_action(
+            update,
+            context,
+            "edit_route",
+            target_type="route",
+            target_id=route.id,
+            details=f"Route #{route.id} ('{route.name}') {state_str}",
+        )
         await query.answer(f"Route #{route.id} {state_str}.")
         try:
             await query.edit_message_reply_markup(reply_markup=None)
@@ -1154,6 +1195,14 @@ async def editroute_menu_callback(
 
     if data == "editroute:clearphotos":
         removed = store.clear_route_photos(route.id)
+        _log_action(
+            update,
+            context,
+            "edit_route",
+            target_type="route",
+            target_id=route.id,
+            details=f"Cleared {removed} picture(s) from Route #{route.id}",
+        )
         await query.answer("Pictures cleared.")
         try:
             await query.edit_message_reply_markup(reply_markup=None)
@@ -1288,6 +1337,14 @@ async def editroute_name_text(
             f"Route #{route_id} not found.", reply_markup=_menu_button_markup()
         )
         return ConversationHandler.END
+    _log_action(
+        update,
+        context,
+        "edit_route",
+        target_type="route",
+        target_id=route_id,
+        details=f"Route #{route_id} renamed to '{updated.name}'",
+    )
     await update.effective_message.reply_text(
         f"✅ Route #{route_id} name updated to '{updated.name}'."
     )
@@ -1301,7 +1358,7 @@ async def editroute_category_callback(
     query = update.callback_query
     if not query or not query.message:
         return ConversationHandler.END
-    if not _can_manage_routes(update):
+    if not _can_manage_routes(update, context):
         await query.answer("Routesetter or admin access required.", show_alert=True)
         return ConversationHandler.END
 
@@ -1328,6 +1385,14 @@ async def editroute_category_callback(
         _clear_conversation_data(context)
         await query.answer("Route not found.", show_alert=True)
         return ConversationHandler.END
+    _log_action(
+        update,
+        context,
+        "edit_route",
+        target_type="route",
+        target_id=route_id,
+        details=f"Route #{route_id} ('{updated.name}') category set to {cat}",
+    )
     await query.answer(f"Category set to {cat}.")
     await query.message.reply_text(
         f"Route #{route_id} ('{updated.name}') category set to {cat}."
@@ -1364,6 +1429,14 @@ async def editroute_category_text(
             f"Route #{route_id} not found.", reply_markup=_menu_button_markup()
         )
         return ConversationHandler.END
+    _log_action(
+        update,
+        context,
+        "edit_route",
+        target_type="route",
+        target_id=route_id,
+        details=f"Route #{route_id} ('{updated.name}') category set to {category}",
+    )
     await update.effective_message.reply_text(
         f"Route #{route_id} ('{updated.name}') category set to {category}."
     )
@@ -1395,6 +1468,14 @@ async def editroute_points_text(
 
     had_zone = old_route.zone_points is not None
     updated = store.update_route(route_id, points=pts)
+    _log_action(
+        update,
+        context,
+        "edit_route",
+        target_type="route",
+        target_id=route_id,
+        details=f"Route #{route_id} ('{old_route.name}') points set to {pts}",
+    )
     zone_cleared_note = (
         " (zone points cleared because top points are now <= previous zone points)"
         if (had_zone and updated and updated.zone_points is None)
@@ -1413,7 +1494,7 @@ async def editroute_zone_callback(
     query = update.callback_query
     if not query or not query.message:
         return ConversationHandler.END
-    if not _can_manage_routes(update):
+    if not _can_manage_routes(update, context):
         await query.answer("Routesetter or admin access required.", show_alert=True)
         return ConversationHandler.END
 
@@ -1430,11 +1511,19 @@ async def editroute_zone_callback(
 
     if data == "editroute:clearzone":
         updated = _store(context).update_route(route_id, zone_points=None)
-        await query.answer("Zone points cleared.")
         if updated:
+            _log_action(
+                update,
+                context,
+                "edit_route",
+                target_type="route",
+                target_id=route_id,
+                details=f"Route #{route_id} ('{updated.name}') zone points cleared",
+            )
             await query.message.reply_text(
                 f"Route #{route_id} ('{updated.name}') zone points cleared."
             )
+        await query.answer("Zone points cleared.")
         return await _send_editroute_menu(query.message, context, route_id)
 
     await query.answer("Invalid option.", show_alert=True)
@@ -1466,6 +1555,14 @@ async def editroute_zone_text(
     raw = (update.effective_message.text or "").strip().lower()
     if raw in {"none", "off", "0", "clear", "skip"}:
         store.update_route(route_id, zone_points=None)
+        _log_action(
+            update,
+            context,
+            "edit_route",
+            target_type="route",
+            target_id=route_id,
+            details=f"Route #{route_id} ('{route.name}') zone points cleared",
+        )
         await update.effective_message.reply_text(
             f"Route #{route_id} ('{route.name}') zone points cleared."
         )
@@ -1479,6 +1576,14 @@ async def editroute_zone_text(
         return EDITROUTE_ZONE
 
     store.update_route(route_id, zone_points=z_pts)
+    _log_action(
+        update,
+        context,
+        "edit_route",
+        target_type="route",
+        target_id=route_id,
+        details=f"Route #{route_id} ('{route.name}') zone points set to {z_pts}",
+    )
     await update.effective_message.reply_text(
         f"Route #{route_id} ('{route.name}') zone points set to {z_pts} pts."
     )
@@ -1543,6 +1648,15 @@ async def editroute_photos_done(
     """Finish adding pictures via /done and return to the Edit Route Dashboard."""
     route_id = int(context.user_data.get("editroute_id") or 0)
     added = int(context.user_data.pop("editroute_photo_count", 0))
+    if added > 0:
+        _log_action(
+            update,
+            context,
+            "edit_route",
+            target_type="route",
+            target_id=route_id,
+            details=f"Added {added} picture(s) to Route #{route_id}",
+        )
     if update.effective_message:
         await update.effective_message.reply_text(
             f"Finished adding {added} picture(s) to Route #{route_id}."
@@ -1558,11 +1672,20 @@ async def editroute_photos_callback(
     query = update.callback_query
     if not query or not query.message:
         return ConversationHandler.END
-    if not _can_manage_routes(update):
+    if not _can_manage_routes(update, context):
         await query.answer("Routesetter or admin access required.", show_alert=True)
         return ConversationHandler.END
     route_id = int(context.user_data.get("editroute_id") or 0)
     added = int(context.user_data.pop("editroute_photo_count", 0))
+    if added > 0:
+        _log_action(
+            update,
+            context,
+            "edit_route",
+            target_type="route",
+            target_id=route_id,
+            details=f"Added {added} picture(s) to Route #{route_id}",
+        )
     await query.answer("Done adding pictures.")
     try:
         await query.edit_message_reply_markup(reply_markup=None)
@@ -1580,7 +1703,9 @@ async def stale_addroute_callback(update: Update, context: ContextTypes.DEFAULT_
     if not query:
         return
     data = query.data or ""
-    if data.startswith(("addroute:", "editroute:")) and not _can_manage_routes(update):
+    if data.startswith(("addroute:", "editroute:", "addchal:", "editchal:")) and not _can_manage_routes(
+        update, context
+    ):
         await query.answer("Routesetter or admin access required.", show_alert=True)
         return
     try:

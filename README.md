@@ -5,41 +5,36 @@ Telegram bot for the climbing league at École Polytechnique. Students can regis
 ## Features
 
 - **Coexisting Role-Separated GUI & Slash Commands**:
-  - Interactive GUI buttons and slash commands are both active at all times (GUI shown by default on `/start`, `/menu`, and directly upon cancelling an action).
-  - Terminal bot messages include a `📋 Open Menu` button so users can reopen their role menus with one tap.
+  - Interactive GUI buttons and slash commands are both active at all times (GUI shown by default on `/start` and `/menu`).
+  - Terminal bot messages (including `/cancel`) include a `📋 Open Menu` button so users can reopen their role menus with one tap.
   - Role-separated menus:
-    - **👤 Unregistered Menu** (shown to unregistered users: register, browse routes, leaderboard, role, rules, commands)
+    - **👤 Unregistered Menu** (shown to unregistered users: register, browse routes & challenges, leaderboard, role, rules, commands)
     - **🧗 Climber Menu** (shown to registered climbers, without the Register option)
     - **🔧 Routesetter Menu** (shown to routesetters and admins)
     - **🛡️ Admin Menu** (shown to admins)
 
 - **Unregistered & Climber Flow**:
   - `/register`: Register full name, optional leaderboard username (can be skipped to display full name), and `@polytechnique.edu` email address, with a confirmation summary warning that full name and email cannot be freely modified afterwards.
-  - `/profile` (or `/me`): View personal rank, username, full name, total points, completed tops, zones, pending submissions, and role badge, with an inline `✏️ Edit Profile` button.
+  - `/profile` (or `/me`): View personal rank, username, full name, total points, completed tops, zones, completed challenges, pending submissions, and role badge, with an inline `✏️ Edit Profile` button.
   - `/editprofile`: Edit profile fields with a confirmation summary before saving. Username changes apply immediately; modifying full name or email submits an approval request to admins.
-  - `/routes [category]`: View active routes grouped by location category (`Arkose`, `ENSTA gym`, `Pan`, `Outdoors`), points, zone points, picture count, and personal status (`✅ Completed`, `🔶 Zone`, `⏳ Pending review`).
-  - `/route [route_id]`: View full info and pictures for a route (pictures always appear above the text consistently).
-  - `/submit [route_id]`: Submit video proof for a route.
-  - `/withdraw <route_id>`: Withdraw a pending submission before review.
-  - `/leaderboard`: View live standings with podium medals (`🥇, 🥈, 🥉`), tie-breaking, and personal rank summary.
-  - `/role`: Check your active role (`Unregistered`, `Climber`, `Routesetter`, `Admin`) and capabilities.
-  - `/rules`: View competition explanations, scoring rules, and video proof requirements.
-  - `/commands`: View available slash commands filtered for your role.
-  - `/cancel`: Cancel any ongoing multi-step action and immediately display your role menu(s).
+  - `/routes [category]` & `/route [route_id]`: Browse active routes grouped by location category (`Arkose`, `ENSTA gym`, `Pan`, `Outdoors`), full route details, pictures, and personal status (`✅ Completed`, `🔶 Zone`, `⏳ Pending review`).
+  - `/challenges` & `/challenge [challenge_id]`: Browse active challenges, descriptions, points, pictures, and personal status (`✅ Completed`, `⏳ Pending review`).
+  - `/submit [route_id]` & `/withdraw <route_id>`: Submit video proof for a route or withdraw a pending submission.
+  - `/submitchallenge [challenge_id]` & `/withdrawchallenge <challenge_id>`: Submit **video or photo** proof for a challenge or withdraw a pending submission.
+  - `/leaderboard`: View live standings (route + challenge points) with podium medals (`🥇, 🥈, 🥉`), tie-breaking, and personal rank summary.
+  - `/role`, `/rules`, `/commands`, `/cancel`: Check active role, competition rules, role-filtered commands, or cancel an active action.
 
-- **Routesetter Flow (`ROUTESETTER_IDS` & `ADMIN_IDS`)**:
-  - `/addroute`: Guided or quick route creation with category (`Arkose`, `ENSTA gym`, `Pan`, `Outdoors`), name, points, optional partial zone points (for routes worth 2+ points), and pictures.
-  - `/editroute [route_id]`: Unified interactive route editor to add or modify a route's name, category, top points, partial zone points (with 1-point route protection), pictures (add or clear), and active/inactive status.
-  - `/routes all [category]`: View all routes including inactive ones.
+- **Routesetter Flow (In-Bot `/routesetters` + optional `.env` `ROUTESETTER_IDS` fallback, & `ADMIN_IDS`)**:
+  - `/addroute` & `/editroute [route_id]`: Create and edit routes (category, name, points, optional zone points, pictures, active/inactive status).
+  - `/addchallenge` & `/editchallenge [challenge_id]`: Create and edit challenges (name, optional description, points, optional pictures, activate/deactivate; admins can also permanently delete challenges).
+  - `/routes all [category]` & `/challenges all`: View all routes or challenges including inactive ones.
 
-- **Admin Moderation & Lifecycle (`ADMIN_IDS`)**:
-  - **Inline Video Review Cards & Pending Review GUI**: `/pending` (and `⏳ Pending` in the Admin Menu) provides a paginated interactive review queue with clickable submission buttons, `▶️ Review Next Pending`, `🔄 Refresh`, and post-review `⏭️ Next Pending` navigation. Video review cards include `[Approve ✅]`, `[Zone (<pts> pts) 🔶]` (only shown if the route has established zone points), and `[Reject ❌]` buttons.
-  - `/pending` & `/submissions [all|pending|approved|zone|rejected]`: Interactive pending review GUI and full submission listing.
-  - `/submission <submission_id>`: View video and inline review card for any submission.
-  - `/approve <id>` / `/zone <id>` / `/reject <id> [reason]` / `/reopen <id>`: Review or reopen submissions.
-  - `/profilerequests`, `/approvereq <id>`, `/rejectreq <id> [reason]`: Review student profile modification requests for full name or email changes.
-  - `/export`: Export current competition standings as `climbx_standings.csv`.
-  - `/broadcast <message>`: Broadcast an announcement to all registered climbers.
+- **Admin Moderation, Role Management & Audit Logs (`ADMIN_IDS`)**:
+  - **Unified Pending Submission Review GUI**: `/pending` (and `⏳ Pending` in Admin Menu) provides a paginated interactive review queue across both route and challenge submissions with clickable buttons, `▶️ Review Next Pending`, `🔄 Refresh`, and post-review `⏭️ Next Pending` navigation.
+  - **Submission Commands**: `/submissions`, `/submission <id>`, `/approve`, `/zone`, `/reject`, `/reopen`, plus `/challengesubmissions`, `/challengesubmission <id>`, `/approvechallenge`, `/rejectchallenge`, `/reopenchallenge`.
+  - **Routesetter Role Management**: `/routesetters` (interactive GUI), `/addroutesetter <telegram_id>`, and `/removeroutesetter <telegram_id>` (backed by SQLite; `ROUTESETTER_IDS` in `.env` remains supported as an optional fallback).
+  - **Audit Logging**: `/logs [all|climber|routesetter|admin|<telegram_id>]` (and `📜 Logs` in Admin Menu) provides a filterable, paginated history of climber, routesetter, and admin actions with CSV export.
+  - **Profile Requests, Export & Broadcast**: `/profilerequests`, `/approvereq`, `/rejectreq`, `/export` (standings CSV including challenges), and `/broadcast <message>`.
 
 ## Setup
 
