@@ -5,26 +5,27 @@ Telegram bot for the climbing league at École Polytechnique. Students can regis
 ## Features
 
 - **Coexisting Role-Separated GUI & Slash Commands**:
-  - Interactive GUI buttons and slash commands are both active at all times (GUI shown by default on `/start` and `/menu`).
+  - Interactive GUI buttons and slash commands are both active at all times (GUI shown by default on `/start`, `/menu`, and directly upon cancelling an action).
   - Terminal bot messages include a `📋 Open Menu` button so users can reopen their role menus with one tap.
   - Role-separated menus:
-    - **🧗 Climber Menu** (shown to all users)
+    - **👤 Unregistered Menu** (shown to unregistered users: register, browse routes, leaderboard, role, rules, commands)
+    - **🧗 Climber Menu** (shown to registered climbers, without the Register option)
     - **🔧 Routesetter Menu** (shown to routesetters and admins)
     - **🛡️ Admin Menu** (shown to admins)
 
-- **Climber Flow**:
+- **Unregistered & Climber Flow**:
   - `/register`: Register full name, optional leaderboard username (can be skipped to display full name), and `@polytechnique.edu` email address, with a confirmation summary warning that full name and email cannot be freely modified afterwards.
-  - `/profile` (or `/me`): View personal rank, username, full name, total points, completed tops, zones, pending submissions, and role badge.
+  - `/profile` (or `/me`): View personal rank, username, full name, total points, completed tops, zones, pending submissions, and role badge, with an inline `✏️ Edit Profile` button.
   - `/editprofile`: Edit profile fields with a confirmation summary before saving. Username changes apply immediately; modifying full name or email submits an approval request to admins.
   - `/routes [category]`: View active routes grouped by location category (`Arkose`, `ENSTA gym`, `Pan`, `Outdoors`), points, zone points, picture count, and personal status (`✅ Completed`, `🔶 Zone`, `⏳ Pending review`).
   - `/route [route_id]`: View full info and pictures for a route (pictures always appear above the text consistently).
   - `/submit [route_id]`: Submit video proof for a route.
   - `/withdraw <route_id>`: Withdraw a pending submission before review.
   - `/leaderboard`: View live standings with podium medals (`🥇, 🥈, 🥉`), tie-breaking, and personal rank summary.
-  - `/role`: Check your active role (`Climber`, `Routesetter`, `Admin`) and capabilities.
+  - `/role`: Check your active role (`Unregistered`, `Climber`, `Routesetter`, `Admin`) and capabilities.
   - `/rules`: View competition explanations, scoring rules, and video proof requirements.
-  - `/commands`: View available slash commands for your role.
-  - `/cancel`: Cancel any ongoing multi-step action.
+  - `/commands`: View available slash commands filtered for your role.
+  - `/cancel`: Cancel any ongoing multi-step action and immediately display your role menu(s).
 
 - **Routesetter Flow (`ROUTESETTER_IDS` & `ADMIN_IDS`)**:
   - `/addroute`: Guided or quick route creation with category (`Arkose`, `ENSTA gym`, `Pan`, `Outdoors`), name, points, optional partial zone points (for routes worth 2+ points), and pictures.
@@ -32,8 +33,8 @@ Telegram bot for the climbing league at École Polytechnique. Students can regis
   - `/routes all [category]`: View all routes including inactive ones.
 
 - **Admin Moderation & Lifecycle (`ADMIN_IDS`)**:
-  - **Inline Video Review Cards**: Admins receive video previews with `[Approve ✅]`, `[Zone (<pts> pts) 🔶]` (only shown if the route has established zone points), and `[Reject ❌]` buttons.
-  - `/pending` & `/submissions [all|pending|approved|zone|rejected]`: List pending or all submissions.
+  - **Inline Video Review Cards & Pending Review GUI**: `/pending` (and `⏳ Pending` in the Admin Menu) provides a paginated interactive review queue with clickable submission buttons, `▶️ Review Next Pending`, `🔄 Refresh`, and post-review `⏭️ Next Pending` navigation. Video review cards include `[Approve ✅]`, `[Zone (<pts> pts) 🔶]` (only shown if the route has established zone points), and `[Reject ❌]` buttons.
+  - `/pending` & `/submissions [all|pending|approved|zone|rejected]`: Interactive pending review GUI and full submission listing.
   - `/submission <submission_id>`: View video and inline review card for any submission.
   - `/approve <id>` / `/zone <id>` / `/reject <id> [reason]` / `/reopen <id>`: Review or reopen submissions.
   - `/profilerequests`, `/approvereq <id>`, `/rejectreq <id> [reason]`: Review student profile modification requests for full name or email changes.

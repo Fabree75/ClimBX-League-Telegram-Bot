@@ -69,6 +69,7 @@ from common import (
     _extract_photo_info,
     _extract_video_info,
     _is_admin,
+    _is_registered,
     _is_routesetter,
     _is_valid_email,
     _menu_button_markup,
@@ -77,6 +78,7 @@ from common import (
     _reply_chunked,
     _routesetter_ids,
     _sanitize_single_line,
+    _send_role_menus,
     _store,
     _with_menu_button,
     normalize_route_category,
@@ -152,6 +154,7 @@ from handlers.routes import (
 from handlers.submissions import (
     all_submissions_cmd,
     pending,
+    pending_callback,
     receive_proof,
     reopen_submission_cmd,
     review,
@@ -211,6 +214,7 @@ __all__ = [
     "_extract_photo_info",
     "_extract_video_info",
     "_is_admin",
+    "_is_registered",
     "_is_routesetter",
     "_is_valid_email",
     "_menu_button_markup",
@@ -218,6 +222,7 @@ __all__ = [
     "_reply_chunked",
     "_routesetter_ids",
     "_sanitize_single_line",
+    "_send_role_menus",
     "_store",
     "_with_menu_button",
     "build_application",
@@ -244,7 +249,7 @@ async def _post_init(application: Application) -> None:
         BotCommand("profile", "View your personal score and completed routes"),
         BotCommand("editprofile", "Edit your username or request profile changes"),
         BotCommand("register", "Join the league (@polytechnique.edu)"),
-        BotCommand("role", "Check your role (Climber, Routesetter, Admin)"),
+        BotCommand("role", "Check your role (Unregistered, Climber, Routesetter, Admin)"),
         BotCommand("rules", "View competition rules & video proof requirements"),
         BotCommand("commands", "View available slash commands for your role"),
         BotCommand("cancel", "Cancel current action"),
@@ -629,6 +634,10 @@ def build_application(
             CallbackQueryHandler(
                 review_callback,
                 pattern=r"^review:(approve|reject|reject_now|zone|zone_preset|back):[0-9]+$",
+            ),
+            CallbackQueryHandler(
+                pending_callback,
+                pattern=r"^pending:(page:[0-9]+|review:[0-9]+|next(:[0-9]+)?)$",
             ),
             CallbackQueryHandler(
                 regreq_callback, pattern=r"^regreq:(approve|reject):[0-9]+$"

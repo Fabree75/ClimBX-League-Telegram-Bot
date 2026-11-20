@@ -27,6 +27,7 @@ from common import (
     _parse_positive_int,
     _reply_chunked,
     _sanitize_single_line,
+    _send_role_menus,
     _store,
 )
 from store import LeagueStore
@@ -224,7 +225,9 @@ async def register_confirm_callback(
         _clear_conversation_data(context)
         await query.answer("Cancelled.")
         if query.message:
-            await query.message.reply_text("Cancelled.", reply_markup=_menu_button_markup())
+            await _send_role_menus(
+                query.message, update, context, prefix="Cancelled."
+            )
         return ConversationHandler.END
 
     if data == "reg:confirm":
@@ -253,8 +256,8 @@ async def register_confirm_text(
         )
     if raw in {"no", "n", "cancel"}:
         _clear_conversation_data(context)
-        await update.effective_message.reply_text(
-            "Cancelled.", reply_markup=_menu_button_markup()
+        await _send_role_menus(
+            update.effective_message, update, context, prefix="Cancelled."
         )
         return ConversationHandler.END
 
@@ -394,7 +397,7 @@ async def editprofile_menu_callback(
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await query.message.reply_text("Cancelled.", reply_markup=_menu_button_markup())
+        await _send_role_menus(query.message, update, context, prefix="Cancelled.")
         return ConversationHandler.END
 
     if data == "editprof:clear_username":
@@ -583,7 +586,7 @@ async def editprofile_confirm_callback(
     if data == "editprof:cancel":
         _clear_conversation_data(context)
         await query.answer("Cancelled.")
-        await query.message.reply_text("Cancelled.", reply_markup=_menu_button_markup())
+        await _send_role_menus(query.message, update, context, prefix="Cancelled.")
         return ConversationHandler.END
 
     if data == "editprof:back":

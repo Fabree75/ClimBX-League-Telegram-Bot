@@ -16,15 +16,22 @@ from common import (
     GUI_PROMPT_INPUT,
     MAX_TELEGRAM_MESSAGE_LENGTH,
     ROUTE_CATEGORIES,
+    _admin_menu_keyboard,
     _can_manage_routes,
     _clear_conversation_data,
+    _climber_menu_keyboard,
     _compute_competition_ranks,
     _is_admin,
+    _is_registered,
     _is_routesetter,
     _menu_button_markup,
     _parse_positive_int,
     _reply_chunked,
+    _routesetter_menu_keyboard,
+    _send_role_menus,
     _store,
+    _unregistered_menu_keyboard,
+    _with_menu_button,
 )
 from handlers.registration import editprofile_start, register_start, regrequests_cmd
 from handlers.routes import (
@@ -44,118 +51,56 @@ from handlers.submissions import (
 LOGGER = logging.getLogger(__name__)
 
 
-def _climber_menu_keyboard() -> InlineKeyboardMarkup:
-    """GUI menu shown to all users (Climbers, Routesetters, and Admins)."""
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("🧗 Routes", callback_data="gui:cmd:routes"),
-                InlineKeyboardButton("🔍 Route Info", callback_data="gui:cmd:route"),
-            ],
-            [
-                InlineKeyboardButton("🎥 Submit Proof", callback_data="gui:cmd:submit"),
-                InlineKeyboardButton("↩️ Withdraw", callback_data="gui:cmd:withdraw"),
-            ],
-            [
-                InlineKeyboardButton("👤 My Profile", callback_data="gui:cmd:profile"),
-                InlineKeyboardButton("✏️ Edit Profile", callback_data="gui:cmd:editprofile"),
-            ],
-            [
-                InlineKeyboardButton("🏆 Leaderboard", callback_data="gui:cmd:leaderboard"),
-                InlineKeyboardButton("📝 Register", callback_data="gui:cmd:register"),
-            ],
-            [
-                InlineKeyboardButton("🪪 My Role", callback_data="gui:cmd:role"),
-                InlineKeyboardButton("📖 Rules", callback_data="gui:cmd:rules"),
-                InlineKeyboardButton("⌨️ Commands", callback_data="gui:cmd:commands"),
-            ],
-        ]
-    )
-
-
-def _routesetter_menu_keyboard() -> InlineKeyboardMarkup:
-    """GUI menu shown to Routesetters and Admins."""
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("➕ Add Route", callback_data="gui:cmd:addroute"),
-                InlineKeyboardButton("✏️ Edit Route", callback_data="gui:cmd:editroute"),
-            ],
-            [
-                InlineKeyboardButton(
-                    "📋 All Routes (incl. Inactive)", callback_data="gui:cmd:routes_all"
-                ),
-            ],
-        ]
-    )
-
-
-def _admin_menu_keyboard() -> InlineKeyboardMarkup:
-    """GUI menu shown exclusively to Admins."""
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("⏳ Pending", callback_data="gui:cmd:pending"),
-                InlineKeyboardButton("📋 All Submissions", callback_data="gui:cmd:submissions"),
-            ],
-            [
-                InlineKeyboardButton("🔎 View Submission", callback_data="gui:cmd:submission"),
-                InlineKeyboardButton(
-                    "🪪 Profile Requests", callback_data="gui:cmd:profilerequests"
-                ),
-            ],
-            [
-                InlineKeyboardButton("📊 Export CSV", callback_data="gui:cmd:export"),
-                InlineKeyboardButton("📢 Broadcast", callback_data="gui:cmd:broadcast"),
-            ],
-        ]
-    )
-
-
-async def _send_role_menus(message: Any, update: Update) -> None:
-    """Send the separated Climber Menu, plus Routesetter Menu and Admin Menu as applicable."""
-    await message.reply_text(
-        "🧗 Climber Menu — select an action below:",
-        reply_markup=_climber_menu_keyboard(),
-    )
-    if _can_manage_routes(update):
-        await message.reply_text(
-            "🔧 Routesetter Menu — manage climbing routes:",
-            reply_markup=_routesetter_menu_keyboard(),
-        )
-    if _is_admin(update):
-        await message.reply_text(
-            "🛡️ Admin Menu — competition administration:",
-            reply_markup=_admin_menu_keyboard(),
-        )
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send welcome overview and role-separated GUI menus."""
     if not update.effective_message:
         return
     is_admin = _is_admin(update)
     is_setter = _is_routesetter(update)
-    text = (
-        "🧗 Welcome to the ClimbX League at École Polytechnique!\n\n"
-        "You can interact using either the GUI buttons below or slash commands at any time:\n"
-        "• /register - Join the league (@polytechnique.edu email)\n"
-        "• /profile & /editprofile - View or update your climber profile\n"
-        "• /routes & /route <id> - Browse climbing routes & pictures\n"
-        "• /submit <id> & /withdraw <id> - Submit or withdraw video proof\n"
-        "• /leaderboard - View the live standings\n"
-        "• /role - Check your role & permissions\n"
-        "• /rules & /commands - Competition rules & full command list\n"
-        "• /menu - Open the interactive GUI menus"
-    )
-    if is_admin:
-        text += "\n\n🛡️ You have Admin rights (Climber + Routesetter + Admin menus enabled)."
-    elif is_setter:
-        text += "\n\n🔧 You have Routesetter rights (Climber + Routesetter menus enabled)."
+    is_registered = _is_registered(update, context)
 
-    await update.effective_message.reply_text(
-        text, reply_markup=_climber_menu_keyboard()
-    )
+    if is_registered:
+        text = (
+            "🧗 Welcome to the ClimbX League at École Polytechnique!\n\n"
+            "You can interact using either the GUI buttons below or slash commands at any time:\n"
+            "• /profile & /editprofile - View or update your climber profile\n"
+            "• /routes & /route <id> - Browse climbing routes & pictures\n"
+            "• /submit <id> & /withdraw <id> - Submit or withdraw video proof\n"
+            "• /leaderboard - View the live standings\n"
+            "• /role - Check your role & permissions\n"
+            "• /rules & /commands - Competition rules & full command list\n"
+            "• /menu - Open the interactive GUI menus"
+        )
+        if is_admin:
+            text += "\n\n🛡️ You have Admin rights (Climber + Routesetter + Admin menus enabled)."
+        elif is_setter:
+            text += "\n\n🔧 You have Routesetter rights (Climber + Routesetter menus enabled)."
+        primary_markup = _climber_menu_keyboard()
+    else:
+        text = (
+            "🧗 Welcome to the ClimbX League at École Polytechnique!\n\n"
+            "You are currently browsing as an Unregistered user. Register to unlock full Climber features!\n"
+            "Available actions using the GUI buttons below or slash commands:\n"
+            "• /register - Join the league (@polytechnique.edu email)\n"
+            "• /routes & /route <id> - Browse climbing routes & pictures\n"
+            "• /leaderboard - View the live standings\n"
+            "• /role - Check your role & permissions\n"
+            "• /rules & /commands - Competition rules & available command list\n"
+            "• /menu - Open the interactive GUI menu"
+        )
+        if is_admin:
+            text += (
+                "\n\n🛡️ You have Admin rights (Unregistered + Routesetter + Admin menus enabled). "
+                "Use /register if you also want to compete as a climber."
+            )
+        elif is_setter:
+            text += (
+                "\n\n🔧 You have Routesetter rights (Unregistered + Routesetter menus enabled). "
+                "Use /register if you also want to compete as a climber."
+            )
+        primary_markup = _unregistered_menu_keyboard()
+
+    await update.effective_message.reply_text(text, reply_markup=primary_markup)
     if _can_manage_routes(update):
         await update.effective_message.reply_text(
             "🔧 Routesetter Menu — manage climbing routes:",
@@ -172,7 +117,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Display the separated role-based GUI menus."""
     if not update.effective_message:
         return
-    await _send_role_menus(update.effective_message, update)
+    await _send_role_menus(update.effective_message, update, context)
 
 
 async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -210,23 +155,37 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Display role-filtered slash commands (/commands)."""
     if not update.effective_message:
         return
-    text = (
-        "⌨️ <b>ClimbX League Commands</b>\n\n"
-        "<b>🧗 Climber Commands:</b>\n"
-        "• /menu - Open the interactive GUI menus\n"
-        "• /register - Register with your @polytechnique.edu email\n"
-        "• /profile - View your personal stats and completed routes\n"
-        "• /editprofile - Edit your username or request a full name/email change\n"
-        "• <code>/routes [category]</code> - List active routes and your status (✅/🔶/⏳)\n"
-        "• <code>/route [route_id]</code> - View full route info &amp; pictures\n"
-        "• <code>/submit [route_id]</code> - Submit video proof for a route\n"
-        "• <code>/withdraw &lt;route_id&gt;</code> - Cancel a pending submission\n"
-        "• /leaderboard - View competition rankings\n"
-        "• /role - View your current role &amp; permissions\n"
-        "• /rules - View competition rules &amp; video proof requirements\n"
-        "• /commands - View this command reference\n"
-        "• /cancel - Cancel an ongoing action"
-    )
+    if _is_registered(update, context):
+        text = (
+            "⌨️ <b>ClimbX League Commands</b>\n\n"
+            "<b>🧗 Climber Commands:</b>\n"
+            "• /menu - Open the interactive GUI menus\n"
+            "• /profile - View your personal stats and completed routes\n"
+            "• /editprofile - Edit your username or request a full name/email change\n"
+            "• <code>/routes [category]</code> - List active routes and your status (✅/🔶/⏳)\n"
+            "• <code>/route [route_id]</code> - View full route info &amp; pictures\n"
+            "• <code>/submit [route_id]</code> - Submit video proof for a route\n"
+            "• <code>/withdraw &lt;route_id&gt;</code> - Cancel a pending submission\n"
+            "• /leaderboard - View competition rankings\n"
+            "• /role - View your current role &amp; permissions\n"
+            "• /rules - View competition rules &amp; video proof requirements\n"
+            "• /commands - View this command reference\n"
+            "• /cancel - Cancel an ongoing action"
+        )
+    else:
+        text = (
+            "⌨️ <b>ClimbX League Commands</b>\n\n"
+            "<b>👤 Unregistered Commands:</b>\n"
+            "• /menu - Open the interactive GUI menu\n"
+            "• /register - Register with your @polytechnique.edu email to unlock Climber features\n"
+            "• <code>/routes [category]</code> - Browse active climbing routes\n"
+            "• <code>/route [route_id]</code> - View full route info &amp; pictures\n"
+            "• /leaderboard - View competition rankings\n"
+            "• /role - View your current role &amp; permissions\n"
+            "• /rules - View competition rules &amp; video proof requirements\n"
+            "• /commands - View this command reference\n"
+            "• /cancel - Cancel an ongoing action"
+        )
     if _can_manage_routes(update):
         text += (
             "\n\n<b>🔧 Routesetter Commands:</b>\n"
@@ -238,7 +197,7 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if _is_admin(update):
         text += (
             "\n\n<b>🛡️ Admin Commands:</b>\n"
-            "• /pending - List submissions awaiting review\n"
+            "• /pending - List submissions awaiting review (interactive review GUI)\n"
             "• <code>/submissions [all|pending|approved|zone|rejected]</code> - List all submissions\n"
             "• <code>/submission &lt;id&gt;</code> - View video &amp; inline review buttons\n"
             "• <code>/approve &lt;id&gt;</code> - Approve full Top points\n"
@@ -256,17 +215,24 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def role_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Report the caller's role(s) (Climber, Routesetter, Admin) and permissions (/role)."""
+    """Report the caller's role(s) (Unregistered, Climber, Routesetter, Admin) and permissions (/role)."""
     if not update.effective_message:
         return
     user_id = update.effective_user.id if update.effective_user else None
     id_line = f" (Telegram ID: {user_id})" if user_id is not None else ""
     categories_str = ", ".join(ROUTE_CATEGORIES)
+    is_registered = _is_registered(update, context)
 
     if _is_admin(update):
+        climber_note = (
+            "You have full Admin, Routesetter, and Climber rights in ClimbX League."
+            if is_registered
+            else "You have Admin and Routesetter rights in ClimbX League. "
+            "(You are not registered as a climber yet — use /register if you also want to compete.)"
+        )
         await update.effective_message.reply_text(
             f"🛡️ Role: Admin{id_line}\n"
-            "You have full Admin, Routesetter, and Climber rights in ClimbX League.\n\n"
+            f"{climber_note}\n\n"
             "Your capabilities include:\n"
             "• Routesetter tools: /addroute, /editroute (modify name, category, points, zone points, pictures, active/inactive), /routes all\n"
             "• Submission moderation: /pending, /submissions, /submission <id>, /approve <id>, "
@@ -279,9 +245,15 @@ async def role_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if _is_routesetter(update):
+        climber_note = (
+            "You have Routesetter and Climber rights in ClimbX League (no admin moderation rights)."
+            if is_registered
+            else "You have Routesetter rights in ClimbX League (no admin moderation rights). "
+            "(You are not registered as a climber yet — use /register if you also want to compete.)"
+        )
         await update.effective_message.reply_text(
             f"🔧 Role: Routesetter{id_line}\n"
-            "You have Routesetter and Climber rights in ClimbX League (no admin moderation rights).\n\n"
+            f"{climber_note}\n\n"
             "Your routesetter capabilities include:\n"
             "• Create routes: /addroute (with category, points, zone points & pictures)\n"
             "• Edit routes: /editroute [route_id] (modify name, category, points, zone points, pictures, or active/inactive status)\n"
@@ -291,31 +263,49 @@ async def role_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    if is_registered:
+        await update.effective_message.reply_text(
+            f"🧗 Role: Climber{id_line}\n"
+            "You are a registered climber. You can view your profile with /profile, edit it with /editprofile, "
+            "browse routes with /routes and /route, submit climb videos with /submit, and view /leaderboard.\n"
+            "Ask a league organizer if you need routesetter or admin rights.",
+            reply_markup=_menu_button_markup(),
+        )
+        return
+
     await update.effective_message.reply_text(
-        f"🧗 Role: Climber{id_line}\n"
-        "You have standard climber access. You can register with /register, edit your profile with /editprofile, "
-        "browse routes with /routes and /route, and submit climb videos with /submit.\n"
-        "Ask a league organizer if you need routesetter or admin rights.",
-        reply_markup=_menu_button_markup(),
+        f"👤 Role: Unregistered{id_line}\n"
+        "You are not registered in ClimbX League yet.\n\n"
+        "You can currently:\n"
+        "• Join the league with /register (unlocks Climber features: /profile, /editprofile, /submit, /withdraw)\n"
+        "• Browse routes with /routes & /route, view /leaderboard, read /rules, and check /commands",
+        reply_markup=_with_menu_button(
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("📝 Register", callback_data="gui:cmd:register")]]
+            )
+        ),
     )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel any active multi-step conversation."""
+    """Cancel any active multi-step conversation and show the role menu directly."""
     _clear_conversation_data(context)
     if update.effective_message:
-        await update.effective_message.reply_text(
-            "Cancelled.", reply_markup=_menu_button_markup()
+        await _send_role_menus(
+            update.effective_message, update, context, prefix="Cancelled."
         )
     return ConversationHandler.END
 
 
 async def cancel_idle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Respond cleanly when /cancel is used outside an active conversation."""
+    """Respond cleanly when /cancel is used outside an active conversation and show the menu."""
     _clear_conversation_data(context)
     if update.effective_message:
-        await update.effective_message.reply_text(
-            "No active action to cancel.", reply_markup=_menu_button_markup()
+        await _send_role_menus(
+            update.effective_message,
+            update,
+            context,
+            prefix="No active action to cancel.",
         )
 
 
@@ -328,22 +318,27 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     is_setter = _is_routesetter(update)
     info = store.get_student_profile(update.effective_user.id)
     if not info:
+        register_markup = _with_menu_button(
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("📝 Register", callback_data="gui:cmd:register")]]
+            )
+        )
         if is_admin:
             await update.effective_message.reply_text(
                 "🛡️ Role: Admin (use /role to view admin & routesetter capabilities).\n\n"
                 "You are not registered as a climber yet. Use /register if you also want to join the league!",
-                reply_markup=_menu_button_markup(),
+                reply_markup=register_markup,
             )
         elif is_setter:
             await update.effective_message.reply_text(
                 "🔧 Role: Routesetter (use /role to view routesetter capabilities).\n\n"
                 "You are not registered as a climber yet. Use /register if you also want to join the league!",
-                reply_markup=_menu_button_markup(),
+                reply_markup=register_markup,
             )
         else:
             await update.effective_message.reply_text(
                 "You are not registered yet. Use /register to join the league!",
-                reply_markup=_menu_button_markup(),
+                reply_markup=register_markup,
             )
         return
 
@@ -387,11 +382,16 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for r in info["pending_routes"]:
             lines.append(f"• #{r['route_id']} {r['name']} ({r['points']} pts)")
 
-    lines.append("\nTip: Use /editprofile to modify your profile.")
+    lines.append("\nTip: Use /editprofile or tap Edit Profile below to modify your profile.")
+    profile_markup = _with_menu_button(
+        InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✏️ Edit Profile", callback_data="gui:cmd:editprofile")]]
+        )
+    )
     await _reply_chunked(
         update.effective_message,
         "\n".join(lines),
-        reply_markup=_menu_button_markup(),
+        reply_markup=profile_markup,
     )
 
 
@@ -645,7 +645,7 @@ async def gui_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if data == "gui:menu":
         await query.answer()
-        await _send_role_menus(query.message, update)
+        await _send_role_menus(query.message, update, context)
         return
 
     parts = data.split(":")

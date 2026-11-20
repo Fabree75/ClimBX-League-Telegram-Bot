@@ -37,6 +37,7 @@ from common import (
     _parse_positive_int,
     _reply_chunked,
     _sanitize_single_line,
+    _send_role_menus,
     _store,
     normalize_route_category,
 )
@@ -227,7 +228,11 @@ def _format_route_details_text(
     elif user_status == "pending":
         lines.append("⏳ Your status: Pending review")
     elif route.active:
-        lines.append(f"📝 Your status: Not submitted yet (use /submit {route.id})")
+        is_reg = bool(store and user_id is not None and store.is_registered(user_id))
+        if is_reg:
+            lines.append(f"📝 Your status: Not submitted yet (use /submit {route.id})")
+        else:
+            lines.append("📝 Register with /register to submit climbs for this route.")
     return "\n".join(lines)
 
 
@@ -553,7 +558,9 @@ async def add_route_caption_entry(update: Update, context: ContextTypes.DEFAULT_
     return ConversationHandler.END
 
 
-async def _cancel_addroute_callback(query: Any, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def _cancel_addroute_callback(
+    query: Any, update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
     _clear_conversation_data(context)
     await query.answer("Cancelled.")
     try:
@@ -561,7 +568,7 @@ async def _cancel_addroute_callback(query: Any, context: ContextTypes.DEFAULT_TY
     except Exception:
         pass
     if query.message:
-        await query.message.reply_text("Cancelled.", reply_markup=_menu_button_markup())
+        await _send_role_menus(query.message, update, context, prefix="Cancelled.")
     return ConversationHandler.END
 
 
@@ -601,7 +608,7 @@ async def addroute_category_callback(update: Update, context: ContextTypes.DEFAU
 
     data = query.data or ""
     if data == "addroute:cancel":
-        return await _cancel_addroute_callback(query, context)
+        return await _cancel_addroute_callback(query, update, context)
 
     parts = data.split(":")
     if len(parts) != 3 or parts[0] != "addroute" or parts[1] != "cat":
@@ -858,7 +865,7 @@ async def addroute_photos_callback(update: Update, context: ContextTypes.DEFAULT
 
     data = query.data or ""
     if data == "addroute:cancel":
-        return await _cancel_addroute_callback(query, context)
+        return await _cancel_addroute_callback(query, update, context)
 
     if data == "addroute:setzone":
         points = int(context.user_data.get("addroute_points") or 0)
@@ -1053,7 +1060,7 @@ async def editroute_select_callback(
     if data == "editroute:cancel":
         _clear_conversation_data(context)
         await query.answer("Cancelled.")
-        await query.message.reply_text("Cancelled.", reply_markup=_menu_button_markup())
+        await _send_role_menus(query.message, update, context, prefix="Cancelled.")
         return ConversationHandler.END
 
     parts = data.split(":")
@@ -1109,7 +1116,17 @@ async def editroute_menu_callback(
         return ConversationHandler.END
 
     data = query.data or ""
-    if data in {"editroute:done", "editroute:cancel"}:
+    if data == "editroute:cancel":
+        _clear_conversation_data(context)
+        await query.answer("Cancelled.")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await _send_role_menus(query.message, update, context, prefix="Cancelled.")
+        return ConversationHandler.END
+
+    if data == "editroute:done":
         _clear_conversation_data(context)
         await query.answer("Finished editing.")
         try:
@@ -1558,11 +1575,12 @@ async def editroute_photos_callback(
 
 
 async def stale_addroute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Clear expired /addroute or /editroute inline keyboards when pressed outside an active session."""
+    """Clear expired conversation inline keyboards when pressed outside an active session."""
     query = update.callback_query
     if not query:
         return
-    if not _can_manage_routes(update):
+    data = query.data or ""
+    if data.startswith(("addroute:", "editroute:")) and not _can_manage_routes(update):
         await query.answer("Routesetter or admin access required.", show_alert=True)
         return
     try:

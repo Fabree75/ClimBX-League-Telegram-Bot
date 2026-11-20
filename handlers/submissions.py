@@ -27,6 +27,100 @@ from store import LeagueStore, Route
 
 LOGGER = logging.getLogger(__name__)
 
+PENDING_PAGE_SIZE = 8
+
+
+def _truncate_button_label(text: str, max_len: int = 56) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
+
+
+def _pending_list_keyboard(
+    rows: list[sqlite3.Row], page: int = 0
+) -> InlineKeyboardMarkup:
+    """Build interactive inline keyboard for the admin pending submission review queue."""
+    total = len(rows)
+    total_pages = max(1, (total + PENDING_PAGE_SIZE - 1) // PENDING_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PENDING_PAGE_SIZE
+    page_rows = rows[start : start + PENDING_PAGE_SIZE]
+
+    kb: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("▶️ Review Next Pending", callback_data="pending:next")]
+    ]
+    for row in page_rows:
+        label = _truncate_button_label(
+            f"🎥 #{row['id']} {row['full_name']} — {row['name']} ({row['points']} pts)"
+        )
+        kb.append([InlineKeyboardButton(label, callback_data=f"pending:review:{row['id']}")])
+
+    if total_pages > 1:
+        nav_row: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav_row.append(
+                InlineKeyboardButton("⬅️ Prev", callback_data=f"pending:page:{page - 1}")
+            )
+        nav_row.append(
+            InlineKeyboardButton(
+                f"Page {page + 1}/{total_pages}", callback_data=f"pending:page:{page}"
+            )
+        )
+        if page + 1 < total_pages:
+            nav_row.append(
+                InlineKeyboardButton("Next ➡️", callback_data=f"pending:page:{page + 1}")
+            )
+        kb.append(nav_row)
+
+    kb.append(
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"pending:page:{page}"),
+            InlineKeyboardButton("📋 Open Menu", callback_data="gui:menu"),
+        ]
+    )
+    return InlineKeyboardMarkup(kb)
+
+
+def _format_pending_page_text(rows: list[sqlite3.Row], page: int = 0) -> str:
+    """Format a paginated pending submissions view for inline message edits."""
+    total = len(rows)
+    total_pages = max(1, (total + PENDING_PAGE_SIZE - 1) // PENDING_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PENDING_PAGE_SIZE
+    page_rows = rows[start : start + PENDING_PAGE_SIZE]
+
+    header = (
+        f"⏳ Pending Submissions (Page {page + 1}/{total_pages} — {total} total):"
+        if total_pages > 1
+        else f"⏳ Pending Submissions ({total} total):"
+    )
+    lines = [header, ""]
+    for row in page_rows:
+        lines.append(f"#{row['id']} {row['full_name']} - {row['name']} ({row['points']} pts)")
+    lines.append(
+        "\nTap a submission below to watch video proof & review, or tap ▶️ Review Next Pending."
+    )
+    return "\n".join(lines)
+
+
+def _post_review_nav_markup(store: LeagueStore) -> InlineKeyboardMarkup:
+    """Return quick next-pending / pending-list navigation buttons after a review."""
+    remaining = len(store.pending_submissions())
+    if remaining > 0:
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"⏭️ Next Pending ({remaining} left)",
+                        callback_data="pending:next",
+                    ),
+                    InlineKeyboardButton("📋 Pending List", callback_data="pending:page:0"),
+                ],
+                [InlineKeyboardButton("📋 Open Menu", callback_data="gui:menu")],
+            ]
+        )
+    return _menu_button_markup()
+
 
 def _video_prompt_for_route(route: Route) -> str:
     cat_part = f" · {route.category}" if route.category else ""
@@ -183,7 +277,10 @@ def _format_submission_caption(
 
 
 def _submission_review_keyboard(
-    submission_id: int, zone_points: Optional[int] = None
+    submission_id: int,
+    zone_points: Optional[int] = None,
+    *,
+    include_pending_nav: bool = False,
 ) -> InlineKeyboardMarkup:
     row = [
         InlineKeyboardButton("Approve ✅", callback_data=f"review:approve:{submission_id}")
@@ -198,7 +295,17 @@ def _submission_review_keyboard(
     row.append(
         InlineKeyboardButton("Reject ❌", callback_data=f"review:reject:{submission_id}")
     )
-    return InlineKeyboardMarkup([row])
+    rows = [row]
+    if include_pending_nav:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "⏭️ Next Pending", callback_data=f"pending:next:{submission_id}"
+                ),
+                InlineKeyboardButton("📋 Pending List", callback_data="pending:page:0"),
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 async def _send_submission_to_admin(
@@ -218,6 +325,7 @@ async def _send_submission_to_admin(
     is_zone: bool = False,
     awarded_points: Optional[int] = None,
     zone_points: Optional[int] = None,
+    include_pending_nav: bool = False,
 ) -> Optional[tuple[int, bool]]:
     caption = _format_submission_caption(
         submission_id=submission_id,
@@ -233,7 +341,9 @@ async def _send_submission_to_admin(
     )
 
     keyboard = (
-        _submission_review_keyboard(submission_id, zone_points)
+        _submission_review_keyboard(
+            submission_id, zone_points, include_pending_nav=include_pending_nav
+        )
         if status == "pending"
         else None
     )
@@ -400,7 +510,7 @@ async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List pending submissions for admins."""
+    """List pending submissions with interactive review GUI for admins."""
     if not update.effective_message:
         return
     if not _is_admin(update):
@@ -418,12 +528,171 @@ async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"#{row['id']} {row['full_name']} - {row['name']} ({row['points']} pts)"
         for row in rows
     ]
-    lines.append("\nTip: Use /submission <id> to watch video proof.")
+    lines.append(
+        "\nTip: Tap a submission below to review, tap ▶️ Review Next Pending, or use /submission <id>."
+    )
     await _reply_chunked(
         update.effective_message,
         "\n".join(lines),
-        reply_markup=_menu_button_markup(),
+        reply_markup=_pending_list_keyboard(rows, page=0),
     )
+
+
+async def _send_pending_review_card(
+    bot: Bot,
+    store: LeagueStore,
+    chat_id: int,
+    fallback_message: Any,
+    sub: sqlite3.Row,
+) -> None:
+    """Send a pending submission's video & interactive review card and track it for multi-admin sync."""
+    sub_id = int(sub["id"])
+    zone_pts = int(sub["zone_points"]) if sub["zone_points"] is not None else None
+    try:
+        sent_info = await _send_submission_to_admin(
+            bot=bot,
+            admin_id=chat_id,
+            submission_id=sub_id,
+            student_name=str(sub["full_name"]),
+            student_id=int(sub["telegram_id"]),
+            route_id=int(sub["route_id"]),
+            route_name=str(sub["route_name"]),
+            points=int(sub["points"]),
+            video_file_id=str(sub["video_file_id"]),
+            media_type=str(sub["media_type"] or "video"),
+            status=str(sub["status"]),
+            rejection_reason=sub["rejection_reason"],
+            is_zone=bool(sub["is_zone"]),
+            awarded_points=int(sub["awarded_points"]) if sub["awarded_points"] is not None else None,
+            zone_points=zone_pts,
+            include_pending_nav=True,
+        )
+        if sent_info is not None and str(sub["status"]) == "pending":
+            msg_id, is_caption = sent_info
+            store.record_admin_review_message(sub_id, chat_id, msg_id, is_caption)
+    except Exception:
+        LOGGER.warning("Failed to send pending submission %s video to admin", sub_id)
+        caption = _format_submission_caption(
+            submission_id=sub_id,
+            student_name=str(sub["full_name"]),
+            student_id=int(sub["telegram_id"]),
+            route_id=int(sub["route_id"]),
+            route_name=str(sub["route_name"]),
+            points=int(sub["points"]),
+            status=str(sub["status"]),
+        )
+        sent = await fallback_message.reply_text(
+            f"{caption}\n\n⚠️ Could not load video preview.",
+            reply_markup=_submission_review_keyboard(
+                sub_id, zone_pts, include_pending_nav=True
+            ),
+        )
+        msg_id = getattr(sent, "message_id", None)
+        if isinstance(msg_id, int) and str(sub["status"]) == "pending":
+            store.record_admin_review_message(sub_id, chat_id, msg_id, False)
+
+
+async def pending_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle pending submission review GUI callbacks (pagination, pick, next)."""
+    query = update.callback_query
+    if not query or not query.message or not update.effective_chat:
+        return
+    if not _is_admin(update):
+        await query.answer("Admin access required.", show_alert=True)
+        return
+
+    data = query.data or ""
+    parts = data.split(":")
+    if len(parts) < 2 or parts[0] != "pending":
+        await query.answer("Invalid pending action.", show_alert=True)
+        return
+
+    action = parts[1]
+    store = _store(context)
+
+    if action == "page":
+        if len(parts) != 3 or not parts[2].isascii() or not parts[2].isdigit():
+            await query.answer("Invalid page.", show_alert=True)
+            return
+        page = int(parts[2])
+        rows = store.pending_submissions()
+        if not rows:
+            await query.answer("No pending submissions.")
+            if getattr(query.message, "caption", None) is not None:
+                await query.message.reply_text(
+                    "✅ No pending submissions.",
+                    reply_markup=_menu_button_markup(),
+                )
+            else:
+                try:
+                    await query.edit_message_text(
+                        "✅ No pending submissions.",
+                        reply_markup=_menu_button_markup(),
+                    )
+                except Exception:
+                    await query.message.reply_text(
+                        "✅ No pending submissions.",
+                        reply_markup=_menu_button_markup(),
+                    )
+            return
+
+        await query.answer()
+        page_text = _format_pending_page_text(rows, page=page)
+        page_kb = _pending_list_keyboard(rows, page=page)
+        if getattr(query.message, "caption", None) is not None:
+            await query.message.reply_text(page_text, reply_markup=page_kb)
+        else:
+            try:
+                await query.edit_message_text(page_text, reply_markup=page_kb)
+            except Exception:
+                await query.message.reply_text(page_text, reply_markup=page_kb)
+        return
+
+    if action == "review":
+        sub_id = _parse_positive_int(parts[2]) if len(parts) == 3 else None
+        if sub_id is None:
+            await query.answer("Invalid submission ID.", show_alert=True)
+            return
+        sub = store.get_submission(sub_id)
+        if sub is None or str(sub["status"]) != "pending":
+            await query.answer("This submission was already reviewed.", show_alert=True)
+            return
+        await query.answer()
+        await _send_pending_review_card(
+            context.bot, store, update.effective_chat.id, query.message, sub
+        )
+        return
+
+    if action == "next":
+        rows = store.pending_submissions()
+        if not rows:
+            await query.answer("No pending submissions left!", show_alert=True)
+            await query.message.reply_text(
+                "✅ All pending submissions have been reviewed!",
+                reply_markup=_menu_button_markup(),
+            )
+            return
+
+        after_id = _parse_positive_int(parts[2]) if len(parts) == 3 else None
+        target = rows[0]
+        if after_id is not None:
+            if len(rows) == 1 and int(rows[0]["id"]) == after_id:
+                await query.answer(
+                    "No other pending submissions in the queue.", show_alert=True
+                )
+                return
+            ids = [int(r["id"]) for r in rows]
+            if after_id in ids:
+                next_idx = (ids.index(after_id) + 1) % len(rows)
+                target = rows[next_idx]
+
+        await query.answer()
+        await _send_pending_review_card(
+            context.bot, store, update.effective_chat.id, query.message, target
+        )
+        return
+
+    await query.answer("Invalid pending action.", show_alert=True)
 
 
 async def all_submissions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -508,7 +777,8 @@ async def view_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     try:
-        await _send_submission_to_admin(
+        is_pending = str(sub["status"]) == "pending"
+        sent_info = await _send_submission_to_admin(
             bot=context.bot,
             admin_id=update.effective_chat.id,
             submission_id=int(sub["id"]),
@@ -524,7 +794,13 @@ async def view_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             is_zone=bool(sub["is_zone"]),
             awarded_points=int(sub["awarded_points"]) if sub["awarded_points"] is not None else None,
             zone_points=int(sub["zone_points"]) if sub["zone_points"] is not None else None,
+            include_pending_nav=is_pending,
         )
+        if sent_info is not None and is_pending:
+            msg_id, is_caption = sent_info
+            _store(context).record_admin_review_message(
+                int(sub["id"]), update.effective_chat.id, msg_id, is_caption
+            )
     except Exception:
         LOGGER.warning("Failed to send submission %s video to admin", submission_id)
         await update.effective_message.reply_text(
@@ -610,14 +886,17 @@ async def _sync_admin_review_cards(
 
 
 async def _edit_review_card_decision(
-    query: Any, submission_id: int, decision_label: str
+    query: Any,
+    submission_id: int,
+    decision_label: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
 ) -> None:
     if getattr(query.message, "caption", None) is not None:
         current_caption = query.message.caption or ""
         try:
             await query.edit_message_caption(
                 caption=f"{current_caption}\n\nDecision: {decision_label}",
-                reply_markup=None,
+                reply_markup=reply_markup,
             )
         except Exception:
             LOGGER.warning("Failed to edit review message caption for submission %s", submission_id)
@@ -626,7 +905,7 @@ async def _edit_review_card_decision(
         try:
             await query.edit_message_text(
                 text=f"{current_text}\n\nDecision: {decision_label}",
-                reply_markup=None,
+                reply_markup=reply_markup,
             )
         except Exception:
             LOGGER.warning("Failed to edit review message text for submission %s", submission_id)
@@ -674,6 +953,7 @@ async def _finalize_submission_review(
     awarded_points: Optional[int] = None,
     card_query: Any = None,
     card_info: Optional[tuple[Optional[int], Optional[int], bool, str]] = None,
+    reviewer_reply_markup: Optional[InlineKeyboardMarkup] = None,
 ) -> None:
     """Update originating card, sync other admins' review cards, and notify the student."""
     submission_id = int(submission["id"])
@@ -681,7 +961,9 @@ async def _finalize_submission_review(
     exclude_message_id: Optional[int] = None
 
     if card_query is not None:
-        await _edit_review_card_decision(card_query, submission_id, decision_label)
+        await _edit_review_card_decision(
+            card_query, submission_id, decision_label, reply_markup=reviewer_reply_markup
+        )
         c_id = getattr(getattr(card_query.message, "chat", None), "id", None)
         m_id = getattr(card_query.message, "message_id", None)
         exclude_chat_id = c_id if isinstance(c_id, int) else None
@@ -956,6 +1238,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             is_zone=True,
             awarded_points=awarded,
             card_query=query,
+            reviewer_reply_markup=_post_review_nav_markup(store),
         )
         return
 
@@ -981,6 +1264,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         status=status,
         decision_label=f"{decision_text} by {admin_display}",
         card_query=query,
+        reviewer_reply_markup=_post_review_nav_markup(store),
     )
 
 
@@ -1078,7 +1362,7 @@ async def review_reject_reason_text(
 
     await update.effective_message.reply_text(
         f"Submission #{sub_id} rejected (Reason: {reason}).",
-        reply_markup=_menu_button_markup(),
+        reply_markup=_post_review_nav_markup(store),
     )
     admin_display = update.effective_user.first_name or "Admin"
     await _finalize_submission_review(

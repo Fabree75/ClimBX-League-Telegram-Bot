@@ -220,6 +220,133 @@ def _can_manage_routes(update: Update) -> bool:
     return _is_admin(update) or _is_routesetter(update)
 
 
+def _is_registered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Returns True if the effective user is registered in the students table."""
+    return bool(
+        update.effective_user and _store(context).is_registered(update.effective_user.id)
+    )
+
+
+def _unregistered_menu_keyboard() -> InlineKeyboardMarkup:
+    """GUI menu shown to unregistered users (without climber-only actions)."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📝 Register", callback_data="gui:cmd:register"),
+            ],
+            [
+                InlineKeyboardButton("🧗 Routes", callback_data="gui:cmd:routes"),
+                InlineKeyboardButton("🔍 Route Info", callback_data="gui:cmd:route"),
+            ],
+            [
+                InlineKeyboardButton("🏆 Leaderboard", callback_data="gui:cmd:leaderboard"),
+                InlineKeyboardButton("🪪 My Role", callback_data="gui:cmd:role"),
+            ],
+            [
+                InlineKeyboardButton("📖 Rules", callback_data="gui:cmd:rules"),
+                InlineKeyboardButton("⌨️ Commands", callback_data="gui:cmd:commands"),
+            ],
+        ]
+    )
+
+
+def _climber_menu_keyboard() -> InlineKeyboardMarkup:
+    """GUI menu shown to registered Climbers (without the Register option)."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🧗 Routes", callback_data="gui:cmd:routes"),
+                InlineKeyboardButton("🔍 Route Info", callback_data="gui:cmd:route"),
+            ],
+            [
+                InlineKeyboardButton("🎥 Submit Proof", callback_data="gui:cmd:submit"),
+                InlineKeyboardButton("↩️ Withdraw", callback_data="gui:cmd:withdraw"),
+            ],
+            [
+                InlineKeyboardButton("👤 My Profile", callback_data="gui:cmd:profile"),
+                InlineKeyboardButton("✏️ Edit Profile", callback_data="gui:cmd:editprofile"),
+            ],
+            [
+                InlineKeyboardButton("🏆 Leaderboard", callback_data="gui:cmd:leaderboard"),
+                InlineKeyboardButton("🪪 My Role", callback_data="gui:cmd:role"),
+            ],
+            [
+                InlineKeyboardButton("📖 Rules", callback_data="gui:cmd:rules"),
+                InlineKeyboardButton("⌨️ Commands", callback_data="gui:cmd:commands"),
+            ],
+        ]
+    )
+
+
+def _routesetter_menu_keyboard() -> InlineKeyboardMarkup:
+    """GUI menu shown to Routesetters and Admins."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("➕ Add Route", callback_data="gui:cmd:addroute"),
+                InlineKeyboardButton("✏️ Edit Route", callback_data="gui:cmd:editroute"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📋 All Routes (incl. Inactive)", callback_data="gui:cmd:routes_all"
+                ),
+            ],
+        ]
+    )
+
+
+def _admin_menu_keyboard() -> InlineKeyboardMarkup:
+    """GUI menu shown exclusively to Admins."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("⏳ Pending", callback_data="gui:cmd:pending"),
+                InlineKeyboardButton("📋 All Submissions", callback_data="gui:cmd:submissions"),
+            ],
+            [
+                InlineKeyboardButton("🔎 View Submission", callback_data="gui:cmd:submission"),
+                InlineKeyboardButton(
+                    "🪪 Profile Requests", callback_data="gui:cmd:profilerequests"
+                ),
+            ],
+            [
+                InlineKeyboardButton("📊 Export CSV", callback_data="gui:cmd:export"),
+                InlineKeyboardButton("📢 Broadcast", callback_data="gui:cmd:broadcast"),
+            ],
+        ]
+    )
+
+
+async def _send_role_menus(
+    message: Any,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    prefix: Optional[str] = None,
+) -> None:
+    """Send the Unregistered or Climber Menu, plus Routesetter and Admin Menus as applicable."""
+    if _is_registered(update, context):
+        primary_header = "🧗 Climber Menu — select an action below:"
+        primary_markup = _climber_menu_keyboard()
+    else:
+        primary_header = "👤 Unregistered Menu — register to unlock climber features:"
+        primary_markup = _unregistered_menu_keyboard()
+
+    first_text = f"{prefix}\n\n{primary_header}" if prefix else primary_header
+    await message.reply_text(first_text, reply_markup=primary_markup)
+
+    if _can_manage_routes(update):
+        await message.reply_text(
+            "🔧 Routesetter Menu — manage climbing routes:",
+            reply_markup=_routesetter_menu_keyboard(),
+        )
+    if _is_admin(update):
+        await message.reply_text(
+            "🛡️ Admin Menu — competition administration:",
+            reply_markup=_admin_menu_keyboard(),
+        )
+
+
 def _clear_conversation_data(context: ContextTypes.DEFAULT_TYPE) -> None:
     for key in _CONVERSATION_DATA_KEYS:
         context.user_data.pop(key, None)
